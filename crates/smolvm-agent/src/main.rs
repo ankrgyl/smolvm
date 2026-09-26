@@ -5140,9 +5140,11 @@ fn spawn_interactive_command(
 /// disconnects during an interactive exec — the agent must clean up the
 /// child and continue accepting new connections rather than propagating
 /// the I/O error.
+/// The client went away: kill the command and everything it started. For an
+/// image container the command is a grandchild (under `crun exec`), so killing
+/// only the direct child would leave it running.
 fn kill_child_on_disconnect(child: &mut Child) -> i32 {
-    let _ = child.kill();
-    let _ = child.wait();
+    process::kill_child_tree(child);
     124
 }
 
@@ -5195,13 +5197,9 @@ fn run_interactive_loop(
         if let Some(deadline) = deadline {
             if Instant::now() >= deadline {
                 warn!("interactive command timed out, killing process");
-                if let Err(e) = child.kill() {
-                    warn!(error = %e, "failed to kill timed out process");
-                }
-                // Wait to reap the process and avoid zombies
-                if let Err(e) = child.wait() {
-                    warn!(error = %e, "failed to wait for killed process");
-                }
+                // The whole tree: in an image container the command is a
+                // grandchild. Also reaps the child, avoiding a zombie.
+                process::kill_child_tree(child);
                 return Ok(124); // Timeout exit code
             }
         }
@@ -5410,12 +5408,7 @@ fn run_interactive_loop_pty(
         if let Some(deadline) = deadline {
             if Instant::now() >= deadline {
                 warn!("interactive PTY command timed out, killing process");
-                if let Err(e) = child.kill() {
-                    warn!(error = %e, "failed to kill timed out process");
-                }
-                if let Err(e) = child.wait() {
-                    warn!(error = %e, "failed to wait for killed process");
-                }
+                process::kill_child_tree(child);
                 return Ok(124);
             }
         }
