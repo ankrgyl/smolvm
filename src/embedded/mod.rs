@@ -1,10 +1,12 @@
 //! Language-neutral embedded runtime support for SDK bindings.
 
 mod control;
+mod exec;
 mod handle;
 mod runtime;
 
 pub use control::MachineSpec;
+pub use exec::{ExecCancel, ExecOptions};
 pub use runtime::{runtime, EmbeddedRuntime};
 
 /// Parse the trusted loopback interceptor binding supplied by an SDK caller.

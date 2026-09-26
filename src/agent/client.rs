@@ -1098,6 +1098,11 @@ impl AgentClient {
 }
 
 impl AgentClient {
+    /// A second handle to this client's connection, so another thread can
+    /// shut it down (see `ExecCancel`) while this one is blocked reading.
+    pub(crate) fn clone_stream(&self) -> std::io::Result<UdsStream> {
+        self.stream.try_clone()
+    }
     /// Set socket read timeout, returning an error if it fails.
     ///
     /// This is a helper to ensure timeout failures are always handled properly,

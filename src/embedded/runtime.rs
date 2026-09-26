@@ -4,10 +4,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::Duration;
 
-use crate::agent::{ExecEvent, RunConfig};
+use crate::agent::{AgentClient, ExecEvent, RunConfig};
 use crate::config::RecordState;
 use crate::db::SmolvmDb;
 use crate::embedded::control::{self, MachineSpec};
+use crate::embedded::exec::{ExecCancel, ExecOptions};
 use crate::embedded::handle::VmHandle;
 use crate::{Error, Result};
 use smolvm_protocol::ImageInfo;
@@ -786,28 +787,84 @@ impl EmbeddedRuntime {
         workdir: Option<String>,
         timeout: Option<Duration>,
     ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
+        let options = ExecOptions {
+            env,
+            workdir,
+            timeout,
+            user: None,
+        };
+        self.exec_with_options(name, command, options)
+    }
+
+    /// Execute a command and return `(exit_code, stdout, stderr)`.
+    ///
+    /// The command runs over its own agent connection, so it never holds the
+    /// machine for its duration: other commands, file transfers and state
+    /// queries on the same machine proceed while it runs.
+    pub fn exec_with_options(
+        &self,
+        name: &str,
+        command: Vec<String>,
+        options: ExecOptions,
+    ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
         let (image, overlay_owner) = self.image_and_overlay_owner(name)?;
-        let handle = self.started_handle(name)?;
-        let mut handle = lock_handle(&handle)?;
-        match image {
-            // Image machine: run inside the machine's persistent container overlay,
-            // exactly as the streaming counterpart does — and as the CLI and the
-            // cloud transport already do. Without this an exec lands in the bare
-            // VM's own rootfs, so the caller silently gets a different filesystem
-            // than the image they asked for.
-            Some(image) => {
-                let config = RunConfig::new(image, command)
-                    .with_env(env)
-                    .with_workdir(workdir)
-                    .with_timeout(timeout)
-                    .with_mounts(self.mount_bindings_for(name)?)
-                    .with_s3_volumes(self.s3_volumes_for(name)?)
-                    .with_persistent_overlay(Some(overlay_owner));
-                handle.run_config(config)
-            }
-            // Bare VM: exec directly against the guest.
-            None => handle.exec(command, env, workdir, timeout),
+        let config = self.command_run_config(name, image, overlay_owner, &command, &options)?;
+        let mut client = self.command_client(name)?;
+        match config {
+            Some(config) => client.run_non_interactive(config),
+            None => client.vm_exec(command, options.env, options.workdir, options.timeout, None),
         }
+    }
+
+    /// The [`RunConfig`] for a command on an image machine, or `None` for a
+    /// bare VM (which rejects a per-command user it cannot honor).
+    ///
+    /// An image machine runs commands inside its persistent container overlay,
+    /// exactly as the CLI and the cloud transport do. Without this a command
+    /// lands in the bare VM's own rootfs, so the caller silently gets a
+    /// different filesystem than the image they asked for.
+    fn command_run_config(
+        &self,
+        name: &str,
+        image: Option<String>,
+        overlay_owner: String,
+        command: &[String],
+        options: &ExecOptions,
+    ) -> Result<Option<RunConfig>> {
+        let Some(image) = image else {
+            if options.user.is_some() {
+                return Err(Error::config(
+                    "exec user",
+                    "running a command as a specific user needs an image machine; \
+                     a bare VM runs every command as root",
+                ));
+            }
+            return Ok(None);
+        };
+        Ok(Some(
+            RunConfig::new(image, command.to_vec())
+                .with_env(options.env.clone())
+                .with_workdir(options.workdir.clone())
+                .with_timeout(options.timeout)
+                .with_user(options.user.clone())
+                .with_mounts(self.mount_bindings_for(name)?)
+                .with_s3_volumes(self.s3_volumes_for(name)?)
+                .with_persistent_overlay(Some(overlay_owner)),
+        ))
+    }
+
+    /// A dedicated agent connection for one command.
+    ///
+    /// The machine's handle lock is held only to confirm it is started and to
+    /// read where its agent listens — never for the command itself. Commands
+    /// used to run over the handle's single cached connection with the lock
+    /// held throughout, so one long command (a dev server, a streamed build)
+    /// stalled every other call on the machine until it exited. The guest
+    /// agent serves each connection on its own thread.
+    fn command_client(&self, name: &str) -> Result<AgentClient> {
+        let handle = self.started_handle(name)?;
+        let socket = lock_handle(&handle)?.agent_socket();
+        AgentClient::connect_with_retry(&socket)
     }
 
     /// Pull an OCI image and run a command inside it.
@@ -994,25 +1051,67 @@ impl EmbeddedRuntime {
         timeout: Option<Duration>,
         on_event: F,
     ) -> Result<()> {
+        let options = ExecOptions {
+            env,
+            workdir,
+            timeout,
+            user: None,
+        };
+        self.exec_streaming_with_options(name, command, options, &ExecCancel::new(), on_event)
+    }
+
+    /// Execute a command, delivering output events live via the callback, over
+    /// its own agent connection (see [`Self::exec_with_options`]).
+    ///
+    /// `cancel` stops the command from another thread: the connection closes,
+    /// the agent kills the command, and this returns `Ok(())` without further
+    /// events. An image machine streams inside its persistent container overlay
+    /// so streamed installs and writes persist like non-streaming ones.
+    pub fn exec_streaming_with_options<F: FnMut(ExecEvent)>(
+        &self,
+        name: &str,
+        command: Vec<String>,
+        options: ExecOptions,
+        cancel: &ExecCancel,
+        on_event: F,
+    ) -> Result<()> {
         let (image, overlay_owner) = self.image_and_overlay_owner(name)?;
-        let handle = self.started_handle(name)?;
-        let mut handle = lock_handle(&handle)?;
-        match image {
-            // Image machine: stream inside the machine's persistent container
-            // overlay so streamed installs/writes persist across execs and
-            // restarts, like non-streaming exec. Keyed by machine name.
-            Some(image) => {
-                let config = RunConfig::new(image, command)
-                    .with_env(env)
-                    .with_workdir(workdir)
-                    .with_timeout(timeout)
-                    .with_mounts(self.mount_bindings_for(name)?)
-                    .with_s3_volumes(self.s3_volumes_for(name)?)
-                    .with_persistent_overlay(Some(overlay_owner));
-                handle.run_streaming_with(config, on_event)
+        let config = self.command_run_config(name, image, overlay_owner, &command, &options)?;
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+        let mut client = self.command_client(name)?;
+        let connection = client
+            .clone_stream()
+            .map_err(|e| Error::agent("exec connection", e.to_string()))?;
+        if !cancel.attach(connection) {
+            return Ok(());
+        }
+        // Once cancelled, the caller has no use for the tail of the stream —
+        // in particular not the "connection closed" error the teardown itself
+        // produces — so stop delivering events.
+        let mut on_event = on_event;
+        let on_event = |event: ExecEvent| {
+            if !cancel.is_cancelled() {
+                on_event(event);
             }
-            // Bare VM: stream directly against the guest.
-            None => handle.exec_streaming_with(command, env, workdir, timeout, on_event),
+        };
+        let result = match config {
+            Some(config) => client.run_streaming_with(config, on_event),
+            None => client.vm_exec_streaming_with(
+                command,
+                options.env,
+                options.workdir,
+                options.timeout,
+                on_event,
+            ),
+        };
+        cancel.detach();
+        match result {
+            // The caller asked for this: the closed connection surfaces as a
+            // read error, which is not a failure of the command.
+            Err(_) if cancel.is_cancelled() => Ok(()),
+            other => other,
         }
     }
 
