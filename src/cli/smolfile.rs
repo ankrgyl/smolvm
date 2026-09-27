@@ -299,7 +299,13 @@ pub fn build_create_params(
     // Do NOT resolve these to CIDRs here — CDN-backed hosts rotate IPs and the
     // resolved addresses would be stale by the time the machine is started.
     // Re-resolution happens at `machine start` time (see start_vm_named).
-    let sf_allow_hosts = network.allow_hosts;
+    let mut sf_allow_hosts = network.allow_hosts;
+    for pattern in network.allow_host_patterns {
+        sf_allow_hosts.push(
+            smolvm_protocol::host_pattern::encode_strict(&pattern)
+                .map_err(|e| smolvm::Error::config("smolfile [network] allow_host_patterns", e))?,
+        );
+    }
 
     // Parse [network].allow_cidrs — these are explicit stable CIDRs, stored as-is.
     let mut allowed_cidrs_vec: Vec<String> = Vec::new();
@@ -550,12 +556,15 @@ pub fn resolve_pack_config(
         env: sf.env.into_iter().map(|e| e.trim().to_string()).collect(),
         workdir: sf.workdir,
         user: sf.user,
-        // [network].allow_hosts / allow_cidrs implies net = true,
+        // [network] host entries / allow_cidrs implies net = true,
         // matching the same logic in build_create_params().
         // Preserve the tri-state: None = unspecified, Some = explicit.
         net: {
             let network_section_implies_net = sf.network.as_ref().is_some_and(|n| {
-                !n.allow_hosts.is_empty() || !n.allow_cidrs.is_empty() || !n.credentials.is_empty()
+                !n.allow_hosts.is_empty()
+                    || !n.allow_host_patterns.is_empty()
+                    || !n.allow_cidrs.is_empty()
+                    || !n.credentials.is_empty()
             });
             if network_section_implies_net {
                 Some(true)

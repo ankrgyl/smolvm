@@ -242,14 +242,11 @@ impl CredentialPolicy {
     }
 }
 
-/// Whether `host` is admitted by a smolvm `allow_hosts` list, whose entries
-/// match themselves and any subdomain.
+/// Whether `host` is admitted by a legacy or opt-in network allow-list entry.
 pub fn covered_by_allow_list(host: &str, allowed: &[String]) -> bool {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    allowed.iter().any(|pattern| {
-        let pattern = pattern.trim_end_matches('.').to_ascii_lowercase();
-        host == pattern || host.ends_with(&format!(".{pattern}"))
-    })
+    allowed
+        .iter()
+        .any(|pattern| crate::host_pattern::matches(host, pattern))
 }
 
 fn valid_binding_name(name: &str) -> bool {
@@ -316,8 +313,12 @@ mod tests {
         };
         policy.validate(Some(&["notion.com".to_string()])).unwrap();
         policy
+            .validate(Some(&["*.notion.com".to_string()]))
+            .unwrap();
+        policy
             .validate(Some(&["api.notion.com".to_string()]))
             .unwrap();
+        assert!(policy.validate(Some(&["=notion.com".to_string()])).is_err());
         let err = policy
             .validate(Some(&["api.github.com".to_string()]))
             .unwrap_err();

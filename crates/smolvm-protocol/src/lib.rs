@@ -53,6 +53,7 @@ pub struct S3Volume {
 pub mod credentials;
 pub mod forkpoint;
 pub mod guest_env;
+pub mod host_pattern;
 pub mod image_ref;
 pub mod intercept;
 pub mod publish_socket;

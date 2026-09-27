@@ -2253,7 +2253,14 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                                 // the shared Vec in a single write-lock acquisition.
                                 // This ensures old rotated-away IPs are removed.
                                 let mut fresh: Vec<(std::net::IpAddr, u8)> = Vec::new();
-                                'hosts: for host in &hosts_copy {
+                                'hosts: for entry in &hosts_copy {
+                                    let Some(host) =
+                                        smolvm_protocol::host_pattern::static_resolution_host(
+                                            entry,
+                                        )
+                                    else {
+                                        continue;
+                                    };
                                     match resolve_host_subprocess(host) {
                                         Ok(new_cidrs) => {
                                             for cidr_str in new_cidrs {

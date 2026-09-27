@@ -102,6 +102,7 @@ fn merge_cli_credentials(
 fn resolve_egress_flags(
     mut allow_cidr: Vec<String>,
     allow_host: Vec<String>,
+    allow_host_pattern: Vec<String>,
     outbound_localhost_only: bool,
     net: bool,
 ) -> smolvm::Result<(Vec<String>, bool, Option<Vec<String>>)> {
@@ -117,14 +118,17 @@ fn resolve_egress_flags(
         allow_cidr.push("127.0.0.0/8".to_string());
         allow_cidr.push("::1/128".to_string());
     }
-    let net = net || !allow_cidr.is_empty();
+    let net = net || !allow_cidr.is_empty() || !allow_host_pattern.is_empty();
 
-    // Preserve original hostnames for DNS filtering (None if no --allow-host was used)
-    let dns_filter_hosts = if allow_host.is_empty() {
-        None
-    } else {
-        Some(allow_host)
-    };
+    // Bare stored names retain their legacy apex-and-subdomains meaning.
+    let mut hosts = allow_host;
+    for pattern in allow_host_pattern {
+        hosts.push(
+            smolvm_protocol::host_pattern::encode_strict(&pattern)
+                .map_err(|e| smolvm::Error::config("--allow-host-pattern", e))?,
+        );
+    }
+    let dns_filter_hosts = if hosts.is_empty() { None } else { Some(hosts) };
 
     Ok((allow_cidr, net, dns_filter_hosts))
 }
@@ -512,7 +516,7 @@ pub struct RunCmd {
     #[arg(
         long,
         value_name = "PATH",
-        conflicts_with_all = ["image", "smolfile", "detach", "name", "gpu", "gpu_vram_mib", "oci_platform", "allow_cidr", "allow_host", "outbound_localhost_only", "secret_env", "secret_file"],
+        conflicts_with_all = ["image", "smolfile", "detach", "name", "gpu", "gpu_vram_mib", "oci_platform", "allow_cidr", "allow_host", "allow_host_pattern", "outbound_localhost_only", "secret_env", "secret_file"],
         help_heading = "Machine source"
     )]
     pub from: Option<PathBuf>,
@@ -629,6 +633,14 @@ pub struct RunCmd {
     /// Allow egress to specific hostname, resolved at VM start (can be used multiple times, implies --net)
     #[arg(long = "allow-host", value_name = "HOSTNAME", help_heading = "Network")]
     pub allow_host: Vec<String>,
+
+    /// Opt-in egress pattern: exact hostname or `*.domain` subdomains only.
+    #[arg(
+        long = "allow-host-pattern",
+        value_name = "PATTERN",
+        help_heading = "Network"
+    )]
+    pub allow_host_pattern: Vec<String>,
 
     /// Bind a credential the workload may use without ever seeing it:
     /// NAME=ENV_VAR@HOST[,HOST...]. The guest gets a placeholder in ENV_VAR;
@@ -1103,8 +1115,13 @@ fn ensure_init_layer(
             create.push(c.clone());
         }
         for h in params.dns_filter_hosts.iter().flatten() {
-            create.push("--allow-host".into());
-            create.push(h.clone());
+            if h.starts_with('=') || h.starts_with("*.") {
+                create.push("--allow-host-pattern".into());
+                create.push(h.strip_prefix('=').unwrap_or(h).to_string());
+            } else {
+                create.push("--allow-host".into());
+                create.push(h.clone());
+            }
         }
         create.push("--".into());
         create.push("/bin/true".into());
@@ -1299,6 +1316,7 @@ impl RunCmd {
         let (cli_allow_cidrs, net, cli_dns_filter_hosts) = resolve_egress_flags(
             self.allow_cidr,
             self.allow_host,
+            self.allow_host_pattern,
             self.outbound_localhost_only,
             self.net || self.allow_host_loopback,
         )?;
@@ -2300,6 +2318,21 @@ impl RunCmd {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn strict_host_flags_enable_network_without_static_cidrs() {
+        let (cidrs, net, hosts) = super::resolve_egress_flags(
+            vec![],
+            vec![],
+            vec!["api.example.com".into(), "*.example.com".into()],
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(cidrs.is_empty());
+        assert!(net);
+        assert_eq!(hosts.unwrap(), ["=api.example.com", "*.example.com"]);
+    }
+
     #[test]
     fn bake_start_forwards_proxy_when_set() {
         // No proxy: plain start. The bake always provisions only (never launches
@@ -3494,6 +3527,10 @@ pub struct CreateCmd {
     #[arg(long = "allow-host", value_name = "HOSTNAME")]
     pub allow_host: Vec<String>,
 
+    /// Opt-in egress pattern: exact hostname or `*.domain` subdomains only.
+    #[arg(long = "allow-host-pattern", value_name = "PATTERN")]
+    pub allow_host_pattern: Vec<String>,
+
     /// Bind a credential the workload may use without ever seeing it:
     /// NAME=ENV_VAR@HOST[,HOST...]. The guest gets a placeholder in ENV_VAR;
     /// the host substitutes the real value (from a `--secret-env`/`--secret-file`
@@ -3688,6 +3725,7 @@ impl CreateCmd {
         let (cli_allow_cidrs, net, cli_dns_filter_hosts) = resolve_egress_flags(
             self.allow_cidr,
             self.allow_host,
+            self.allow_host_pattern,
             self.outbound_localhost_only,
             self.net,
         )?;
@@ -3866,6 +3904,7 @@ impl CreateCmd {
                 || self.network_name.is_some()
                 || !self.allow_cidr.is_empty()
                 || !self.allow_host.is_empty()
+                || !self.allow_host_pattern.is_empty()
                 || self.outbound_localhost_only
                 || self.gpu
                 || self.gpu_vram_mib.is_some()
@@ -3957,6 +3996,7 @@ impl CreateCmd {
         let (cli_allow_cidrs, cli_network, cli_dns_filter_hosts) = resolve_egress_flags(
             self.allow_cidr.clone(),
             self.allow_host.clone(),
+            self.allow_host_pattern.clone(),
             self.outbound_localhost_only,
             self.net,
         )?;

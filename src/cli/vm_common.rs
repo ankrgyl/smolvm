@@ -1693,7 +1693,11 @@ fn start_vm_named_with_db(
     if let Some(ref hosts) = record.dns_filter_hosts {
         if !hosts.is_empty() {
             let existing = resources.allowed_cidrs.get_or_insert_with(Vec::new);
-            for host in hosts {
+            for entry in hosts {
+                let Some(host) = smolvm_protocol::host_pattern::static_resolution_host(entry)
+                else {
+                    continue;
+                };
                 match crate::cli::parsers::resolve_host_to_cidrs(host) {
                     Ok(cidrs) => existing.extend(cidrs),
                     Err(e) => eprintln!(

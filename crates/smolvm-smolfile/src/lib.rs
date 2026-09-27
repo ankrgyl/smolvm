@@ -66,7 +66,8 @@
 //!
 //! | Field | Type | Description |
 //! |-------|------|-------------|
-//! | `allow_hosts` | string[] | Allowed hostnames (resolved to IPs at start) |
+//! | `allow_hosts` | string[] | Legacy hostname and subdomain entries |
+//! | `allow_host_patterns` | string[] | Exact hostnames or `*.` subdomain patterns |
 //! | `allow_cidrs` | string[] | Allowed CIDR ranges (`"10.0.0.0/8"`) |
 //! | `credentials` | table[] | Credential bindings (see below) |
 //!
@@ -359,9 +360,12 @@ pub struct Smolfile {
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
-    /// Allowed egress hostnames (resolved to IPs at VM start).
+    /// Legacy entries allow the named hostname and its subdomains.
     #[serde(default)]
     pub allow_hosts: Vec<String>,
+    /// Opt-in patterns: bare hostnames match exactly; `*.` matches subdomains.
+    #[serde(default)]
+    pub allow_host_patterns: Vec<String>,
     /// Allowed egress CIDR ranges (e.g., `["10.0.0.0/8", "1.1.1.1"]`).
     #[serde(default)]
     pub allow_cidrs: Vec<String>,
@@ -609,6 +613,7 @@ memory = 2048
 
 [network]
 allow_hosts = ["pypi.org"]
+allow_host_patterns = ["api.example.com", "*.files.example.com"]
 allow_cidrs = ["10.0.0.0/8"]
 
 [fork]
@@ -655,6 +660,10 @@ protocol = "http"
 
         let network = sf.network.unwrap();
         assert_eq!(network.allow_hosts, vec!["pypi.org"]);
+        assert_eq!(
+            network.allow_host_patterns,
+            vec!["api.example.com", "*.files.example.com"]
+        );
 
         let fork = sf.fork.unwrap();
         assert_eq!(fork.enabled, Some(true));

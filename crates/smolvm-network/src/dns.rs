@@ -60,19 +60,14 @@ pub fn normalize_hostname(hostname: &str) -> Option<String> {
     }
 }
 
-/// Whether `hostname` matches the allow-list: exact match, or a subdomain of an
-/// allowed entry (`foo.example.com` matches `example.com`, `notexample.com` does
-/// not). Mirrors libkrun's `is_hostname_allowed`.
+/// Match legacy exact-or-subdomain entries and opt-in `=` / `*.` entries.
 pub fn hostname_allowed(hostname: &str, allowed_hosts: &[String]) -> bool {
     let Some(hostname) = normalize_hostname(hostname) else {
         return false;
     };
-    allowed_hosts.iter().any(|allowed| {
-        hostname == *allowed
-            || hostname
-                .strip_suffix(allowed)
-                .is_some_and(|prefix| prefix.ends_with('.'))
-    })
+    allowed_hosts
+        .iter()
+        .any(|allowed| smolvm_protocol::host_pattern::matches(&hostname, allowed))
 }
 
 /// The question name in a DNS query (first question only). `None` on malformed input.
@@ -314,6 +309,12 @@ mod tests {
         assert!(hostname_allowed("a.b.example.com", &allow));
         assert!(!hostname_allowed("notexample.com", &allow));
         assert!(!hostname_allowed("example.com.evil.com", &allow));
+        let exact = vec!["=example.com".to_string()];
+        assert!(hostname_allowed("example.com", &exact));
+        assert!(!hostname_allowed("www.example.com", &exact));
+        let wildcard = vec!["*.example.com".to_string()];
+        assert!(!hostname_allowed("example.com", &wildcard));
+        assert!(hostname_allowed("www.example.com", &wildcard));
     }
 
     #[test]

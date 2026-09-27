@@ -200,6 +200,9 @@ smolvm machine run --net --image alpine --allow-host registry.npmjs.org -- wget 
 
 smolvm machine run --net --image alpine --allow-host registry.npmjs.org -- wget -q -O /dev/null https://google.com
 # fails: not in allow list
+
+# opt in to exact host matching; use '*.example.com' for subdomains
+smolvm machine run --net --image alpine --allow-host-pattern registry.npmjs.org -- wget -q -O /dev/null https://registry.npmjs.org
 ```
 
 **Let untrusted code use a credential it can never read.** The guest gets a placeholder; the host swaps in the real key only on HTTPS requests to the hosts you name. See [docs/credential-substitution.md](docs/credential-substitution.md).
