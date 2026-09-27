@@ -724,6 +724,8 @@ impl PackRunCmd {
                 pod_netns: None,
                 credentials: None,
                 external_interceptor: None,
+                mediated_egress: false,
+                mediated_parent_id: [0; 16],
             };
 
             let config_path = runtime_dir.path().join("boot-config.json");
@@ -1874,6 +1876,8 @@ fn run_from_cache(
             pod_netns: None,
             credentials: None,
             external_interceptor: None,
+            mediated_egress: false,
+            mediated_parent_id: [0; 16],
         };
         let config_path = runtime_dir.path().join("boot-config.json");
         let config_json = serde_json::to_vec(&boot_config)

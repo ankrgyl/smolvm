@@ -9,6 +9,7 @@ import json
 import os
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -35,8 +36,15 @@ def read_exact(sock, length):
 
 def main():
     binary = os.environ.get("SMOLVM_E2E_BIN", "target/debug/smolvm")
-    if not Path("/dev/kvm").exists():
+    if sys.platform not in ("linux", "darwin"):
+        raise RuntimeError("this integration check supports Linux and macOS")
+    if sys.platform == "linux" and not Path("/dev/kvm").exists():
         raise RuntimeError("this integration check requires /dev/kvm")
+    host_home = Path.home()
+    default_rootfs = host_home / (
+        "Library/Application Support/smolvm/agent-rootfs"
+        if sys.platform == "darwin" else ".local/share/smolvm/agent-rootfs"
+    )
     token = os.urandom(32)
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
@@ -69,7 +77,7 @@ def main():
     worker = threading.Thread(target=broker, daemon=True)
     worker.start()
     api_port, rollout_port = free_port(), free_port()
-    with tempfile.TemporaryDirectory(prefix="smolvm-mediated-e2e-") as root:
+    with tempfile.TemporaryDirectory(prefix="sme-", dir="/tmp") as root:
         env = os.environ.copy()
         env.update(
             XDG_CACHE_HOME=root + "/cache",
@@ -77,8 +85,11 @@ def main():
             XDG_CONFIG_HOME=root + "/config",
             SMOLVM_GUEST_ROLLOUT_HOST_PORT=str(rollout_port),
         )
+        if sys.platform == "darwin":
+            # macOS dirs:: paths follow HOME, while Linux honors XDG directly.
+            env["HOME"] = root
         if "SMOLVM_AGENT_ROOTFS" not in env:
-            env["SMOLVM_AGENT_ROOTFS"] = str(Path.home() / ".local/share/smolvm/agent-rootfs")
+            env["SMOLVM_AGENT_ROOTFS"] = str(default_rootfs)
         log_path = Path(root) / "server.log"
         with log_path.open("wb") as log:
             server = subprocess.Popen(

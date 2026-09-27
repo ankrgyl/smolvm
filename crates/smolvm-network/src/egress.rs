@@ -388,9 +388,7 @@ impl EgressPolicy {
                     })
             })
             .map(|rule| rule.action);
-        if action.is_none() {
-            return None;
-        }
+        action?;
         if !is_floored(ip, self.floor) {
             return action;
         }

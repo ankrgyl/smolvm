@@ -673,11 +673,11 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             "an external interceptor is required",
         ));
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     if *mediated_egress {
         return Err(Error::config(
             "mediated egress",
-            "mediated egress is currently supported on Linux hosts only",
+            "mediated egress requires a Linux or macOS host",
         ));
     }
 

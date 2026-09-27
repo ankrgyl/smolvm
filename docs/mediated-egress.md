@@ -1,6 +1,6 @@
 # Mediated egress
 
-Mediated egress lets a Linux host decide each guest TCP flow before smolvm opens an upstream connection. The host's virtio-net gateway identifies the VM launch, destination, and up to 8 KiB of first application bytes to a loopback decider. The decider returns **allow direct**, **deny**, or **redirect**. Redirect keeps the accepted decider connection as the byte stream. smolvm does not terminate TLS or inspect HTTP.
+Mediated egress lets a Linux or macOS host decide each guest TCP flow before smolvm opens an upstream connection. The host's virtio-net gateway identifies the VM launch, destination, and up to 8 KiB of first application bytes to a loopback decider. The decider returns **allow direct**, **deny**, or **redirect**. Redirect keeps the accepted decider connection as the byte stream. smolvm does not terminate TLS or inspect HTTP.
 
 ## Configure a machine
 
@@ -42,4 +42,4 @@ The gateway waits up to 100 ms for the first payload, so server-speaks-first pro
 
 ## Availability
 
-Mediated mode requires Linux virtio-net. It is rejected with TSI, named or pod networking, and built-in credential substitution. Windows, pool workers, and embedded SDK forks do not yet have a mediated binding path; pool creation and embedded forks reject mediated sources before taking a snapshot. The API branch path is supported. The decider must bind to host loopback, and the token must be random and kept confidential because the protocol carries it on the local connection.
+Mediated mode requires virtio-net on Linux or macOS. It is rejected with TSI, named or pod networking, and built-in credential substitution. Windows, pool workers, and embedded SDK forks do not yet have a mediated binding path; pool creation and embedded forks reject mediated sources before taking a snapshot. The API branch path is supported. The decider must bind to host loopback, and the token must be random and kept confidential because the protocol carries it on the local connection.
