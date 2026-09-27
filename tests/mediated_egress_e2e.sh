@@ -105,7 +105,7 @@ done
 token=$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')
 (
   for index in 1 2; do
-    printf '\002broker-ok\n' | nc -N -l 127.0.0.1 "$broker_port" >"$tmp/prelude.$index"
+    printf '\002broker-ok\n' | nc -l 127.0.0.1 "$broker_port" >"$tmp/prelude.$index"
   done
 ) &
 broker_pid=$!
@@ -142,7 +142,7 @@ child_id=$(hex_at "$tmp/prelude.2" 40 16)
 [[ $source_id != "$child_id" && $(hex_at "$tmp/prelude.1" 56 16) == 00000000000000000000000000000000 && $(hex_at "$tmp/prelude.2" 56 16) == "$source_id" ]] || fail 'branch identity or lineage is wrong'
 
 guest source 'printf deny | nc -w 1 1.1.1.1 80'
-printf 'direct-ok\n' | nc -N -l 127.0.0.1 "$direct_port" >"$tmp/direct.request" &
+printf 'direct-ok\n' | nc -l 127.0.0.1 "$direct_port" >"$tmp/direct.request" &
 direct_pid=$!
 guest source "printf direct | nc -w 2 100.96.0.1 $direct_port"
 [[ $body == *'"exitCode":0'* && $body == *'"stdout":"direct-ok\n"'* ]] || fail "direct relay failed: $body"
