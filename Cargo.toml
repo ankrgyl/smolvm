@@ -139,6 +139,7 @@ windows-sys = { version = "0.60", features = [
 [dev-dependencies]
 tempfile = "3"
 smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.19.2" }
+ureq = "2"
 regex = "1"
 tower = { version = "0.5", features = ["util"] }
 wiremock = "0.6"
