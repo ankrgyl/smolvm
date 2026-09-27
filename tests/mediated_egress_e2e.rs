@@ -1,6 +1,6 @@
 //! Run on a Linux KVM or Apple Silicon macOS host with:
 //! `cargo test --test mediated_egress_e2e -- --ignored --nocapture`.
-//! Set `SMOLVM_E2E_BIN` to a signed binary on macOS when needed.
+//! The macOS harness signs an isolated copy of the binary for Hypervisor.framework.
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod vm {
@@ -129,6 +129,25 @@ mod vm {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_smolvm")));
             let root = tempfile::Builder::new().prefix("sme-").tempdir_in("/tmp")?;
+            let binary = if cfg!(target_os = "macos") {
+                let signed = root.path().join("smolvm-signed");
+                fs::copy(&binary, &signed)?;
+                let output = Command::new("codesign")
+                    .args(["--force", "--sign", "-", "--entitlements"])
+                    .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("smolvm.entitlements"))
+                    .arg(&signed)
+                    .output()?;
+                check(
+                    output.status.success(),
+                    format!(
+                        "sign VM binary: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    ),
+                )?;
+                signed
+            } else {
+                binary
+            };
             let api_port = free_port()?;
             let rollout_port = free_port()?;
             let log_path = root.path().join("server.log");
@@ -147,6 +166,9 @@ mod vm {
                 .stderr(Stdio::from(log));
             if cfg!(target_os = "macos") {
                 command.env("HOME", root.path());
+                let lib_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib");
+                command.env("SMOLVM_LIB_DIR", &lib_dir);
+                command.env("DYLD_LIBRARY_PATH", lib_dir);
             }
             let child = command.spawn()?;
             let mut server = Self {

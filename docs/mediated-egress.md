@@ -43,3 +43,5 @@ The gateway waits up to 100 ms for the first payload, so server-speaks-first pro
 ## Availability
 
 Mediated mode requires virtio-net on Linux or macOS. It is rejected with TSI, named or pod networking, and built-in credential substitution. Windows, pool workers, and embedded SDK forks do not yet have a mediated binding path; pool creation and embedded forks reject mediated sources before taking a snapshot. The API branch path is supported. The decider must bind to host loopback, and the token must be random and kept confidential because the protocol carries it on the local connection.
+
+Run the VM test on a Linux KVM or Apple Silicon macOS host with an installed agent rootfs using `cargo test --test mediated_egress_e2e -- --ignored --nocapture`. The macOS test signs a temporary copy of the binary with the Hypervisor.framework entitlement.
