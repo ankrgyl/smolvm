@@ -3353,7 +3353,27 @@ impl ExecCmd {
             let (exit_code, stdout, stderr) = client.run_non_interactive(config)?;
             vm_common::print_output_and_exit(&manager, exit_code, &stdout, &stderr);
         } else {
-            // Bare VM: exec directly in the VM rootfs.
+            // Bare VM: exec directly in the VM rootfs. Its agent runs every
+            // command as root and has no per-command user, so a requested user
+            // cannot be honoured. An explicit `--user` is refused rather than
+            // silently run as root (as the embedded runtime does); a user the
+            // machine was created with is only warned about, so machines that
+            // already rely on the old behaviour keep working.
+            if let Some(user) = &self.user {
+                return Err(smolvm::Error::config(
+                    "exec --user",
+                    format!(
+                        "running a command as '{user}' needs an image machine; \
+                         a bare VM runs every command as root"
+                    ),
+                ));
+            }
+            if let Some(user) = &user {
+                eprintln!(
+                    "warning: this machine was created with user '{user}', but a bare VM \
+                     runs every command as root; the user is not applied"
+                );
+            }
             // Merge record env + resolved secrets with CLI env, same as image path.
             let env = vm_common::merge_env_overrides(&record_env, &env);
             if self.detach {
