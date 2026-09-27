@@ -1,6 +1,6 @@
 //! Portable live-checkpoint compatibility and installation.
 //!
-//! A `.smolcheckpoint` uses the ordinary pack container for files and disks,
+//! A checkpoint file (`.checkpoint`) uses the ordinary pack container for files and disks,
 //! plus a durable libkrun memory/device snapshot. The container can be copied
 //! anywhere; live state is restored only under a versioned, fail-closed runtime
 //! compatibility contract.
@@ -46,6 +46,79 @@ const PENDING_MARKER: &str = "pending";
 const RETAINED_MEMORY_BACKING: &str = ".portable-checkpoint-memory.bin";
 pub(crate) const READONLY_INPUT_DIR: &str = ".restore-input";
 const READONLY_INPUT_MARKER: &str = "readonly-memory";
+/// Service-owned tmpfs directory where a resume stages its checkpoint, so the
+/// RAM image it hands the VMM is never written to disk.
+#[cfg(target_os = "linux")]
+const RESTORE_TMPFS_ROOT: &str = "/dev/shm/smolvm-restore";
+
+/// [`RESTORE_TMPFS_ROOT`], created if needed, when it is usable: the service
+/// runs as root, `/dev/shm` is tmpfs, and the directory is root-owned mode
+/// 0700. `SMOLVM_RESTORE_TMPFS=0` disables it.
+#[cfg(target_os = "linux")]
+fn restore_tmpfs_root() -> Option<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    if std::env::var_os("SMOLVM_RESTORE_TMPFS").is_some_and(|value| value == "0")
+        || unsafe { libc::geteuid() } != 0
+    {
+        return None;
+    }
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c"/dev/shm".as_ptr(), &mut stat) } != 0
+        || stat.f_type != libc::TMPFS_MAGIC
+    {
+        return None;
+    }
+    let root = PathBuf::from(RESTORE_TMPFS_ROOT);
+    match std::fs::DirBuilder::new().mode(0o700).create(&root) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => return None,
+    }
+    restore_tmpfs_root_is_trusted(&root).then_some(root)
+}
+
+#[cfg(target_os = "linux")]
+fn restore_tmpfs_root_is_trusted(root: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(root).is_ok_and(|metadata| {
+        metadata.is_dir() && metadata.uid() == 0 && metadata.mode() & 0o777 == 0o700
+    })
+}
+
+/// Bytes free in the filesystem holding `path`.
+#[cfg(target_os = "linux")]
+fn free_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    (unsafe { libc::statvfs(path.as_ptr(), &mut stat) } == 0)
+        .then(|| stat.f_bavail as u64 * stat.f_frsize as u64)
+}
+
+/// Where a machine's read-only restore RAM input may live: its data directory,
+/// or the restore tmpfs when the checkpoint was staged there.
+fn readonly_input_dirs(vm_dir: &Path) -> Vec<PathBuf> {
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    let mut dirs = vec![vm_dir.join(READONLY_INPUT_DIR)];
+    #[cfg(target_os = "linux")]
+    if let Some(name) = vm_dir.file_name() {
+        let mut tmpfs_name = name.to_os_string();
+        tmpfs_name.push(READONLY_INPUT_DIR);
+        dirs.push(Path::new(RESTORE_TMPFS_ROOT).join(tmpfs_name));
+    }
+    dirs
+}
+
+fn remove_readonly_input(vm_dir: &Path) -> std::io::Result<()> {
+    for dir in readonly_input_dirs(vm_dir) {
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
 
 #[cfg(target_os = "linux")]
 fn readonly_restore_supported() -> bool {
@@ -79,10 +152,21 @@ fn stage_readonly_memory(source: &Path, vm_dir: &Path, asset: &CheckpointAsset) 
     if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
         return Ok(false);
     }
+    // An image extracted onto the restore tmpfs stays there: linking it into
+    // the data directory would cross filesystems and fall back to a disk copy.
+    let tmpfs = restore_tmpfs_root()
+        .filter(|root| std::fs::metadata(root).is_ok_and(|root| root.dev() == metadata.dev()));
+    let [on_disk, on_tmpfs]: [PathBuf; 2] = readonly_input_dirs(vm_dir)
+        .try_into()
+        .expect("disk and tmpfs input directories");
+    let (parent, destination) = match &tmpfs {
+        Some(root) => (root.as_path(), on_tmpfs),
+        None => (vm_dir, on_disk),
+    };
     let staging = tempfile::Builder::new()
         .prefix(".restore-input-")
         .permissions(std::fs::Permissions::from_mode(0o700))
-        .tempdir_in(vm_dir)?;
+        .tempdir_in(parent)?;
     let input = staging.path().join("memory.bin");
     match std::fs::hard_link(source, &input) {
         Ok(()) => {}
@@ -93,12 +177,14 @@ fn stage_readonly_memory(source: &Path, vm_dir: &Path, asset: &CheckpointAsset) 
     // restart between import and start. Subsequent cache hits sync clean pages.
     std::fs::File::open(&input)?.sync_all()?;
     std::fs::File::open(staging.path())?.sync_all()?;
-    let destination = vm_dir.join(READONLY_INPUT_DIR);
-    if destination.exists() {
+    if readonly_input_dirs(vm_dir)
+        .iter()
+        .any(|dir| std::fs::symlink_metadata(dir).is_ok())
+    {
         return Err(Error::agent("retain restore RAM", "input already exists"));
     }
     std::fs::rename(staging.path(), &destination)?;
-    std::fs::File::open(vm_dir)?.sync_all()?;
+    std::fs::File::open(parent)?.sync_all()?;
     Ok(true)
 }
 
@@ -114,10 +200,26 @@ pub(crate) fn open_readonly_memory(vm_dir: &Path) -> Result<std::fs::File> {
         fd::{AsRawFd, FromRawFd},
         unix::fs::{MetadataExt, OpenOptionsExt},
     };
+    let [on_disk, on_tmpfs]: [PathBuf; 2] = readonly_input_dirs(vm_dir)
+        .try_into()
+        .expect("disk and tmpfs input directories");
+    let input_dir = if std::fs::symlink_metadata(&on_disk).is_err()
+        && std::fs::symlink_metadata(&on_tmpfs).is_ok()
+    {
+        if !restore_tmpfs_root_is_trusted(Path::new(RESTORE_TMPFS_ROOT)) {
+            return Err(Error::agent(
+                "open restore RAM",
+                "restore tmpfs must be service-owned mode 0700",
+            ));
+        }
+        on_tmpfs
+    } else {
+        on_disk
+    };
     let directory = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(vm_dir.join(READONLY_INPUT_DIR))?;
+        .open(input_dir)?;
     let metadata = directory.metadata()?;
     if metadata.uid() != 0 || metadata.mode() & 0o777 != 0o700 {
         return Err(Error::agent(
@@ -175,7 +277,7 @@ pub(crate) fn prepare_memory_backend(snapshot: &Path, branchable: bool) -> Resul
         std::fs::File::open(snapshot)?.sync_all()?;
         std::fs::remove_file(snapshot.join(READONLY_INPUT_MARKER))?;
         std::fs::File::open(snapshot)?.sync_all()?;
-        std::fs::remove_dir_all(vm_dir.join(READONLY_INPUT_DIR))?;
+        remove_readonly_input(vm_dir)?;
         std::fs::File::open(vm_dir)?.sync_all()?;
         Ok(())
     }
@@ -381,6 +483,7 @@ pub fn unpack_verified_history_file(artifact: &Path) -> Result<Option<tempfile::
     let Some(checkpoint) = manifest.checkpoint.as_ref() else {
         return Ok(None);
     };
+    let footer = ensure_checkpoint_layout(artifact)?;
     if checkpoint.payload != smolvm_pack::format::CheckpointLayout::Chunked {
         return Ok(None);
     }
@@ -392,7 +495,7 @@ pub fn unpack_verified_history_file(artifact: &Path) -> Result<Option<tempfile::
         .prefix(".unpack-")
         .tempdir_in(&root)
         .map_err(|error| Error::agent("prepare checkpoint unpack", error.to_string()))?;
-    smolvm_pack::assets::decompress_assets_from_file(artifact, directory.path())
+    smolvm_pack::extract::unpack_checkpoint_history(artifact, &footer, directory.path())
         .map_err(|error| Error::agent("unpack checkpoint history", error.to_string()))?;
     if !directory.path().join("checkpoint.json").is_file() {
         return Err(Error::agent(
@@ -476,7 +579,7 @@ pub fn restore_from_path_at(
     let checkpoint = manifest.checkpoint.as_ref().ok_or_else(|| {
         Error::config(
             "restore checkpoint",
-            format!("{} is not a .smolcheckpoint artifact", artifact.display()),
+            format!("{} is not a checkpoint", artifact.display()),
         )
     })?;
     validate_compatibility(checkpoint)?;
@@ -559,6 +662,51 @@ pub fn restore_from_path_at(
             }
         }
         return Err(error);
+    }
+    Ok(())
+}
+
+/// The file extension a checkpoint is written with.
+pub const CHECKPOINT_EXTENSION: &str = "checkpoint";
+
+/// Whether `path` names a checkpoint output: `.checkpoint`, or the earlier
+/// `.smolcheckpoint`, which stays accepted. Readers never depend on the name.
+pub fn has_checkpoint_extension(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| {
+        extension.eq_ignore_ascii_case(CHECKPOINT_EXTENSION)
+            || extension.eq_ignore_ascii_case("smolcheckpoint")
+    })
+}
+
+/// Require the exact layout a checkpoint writer produces: the payload at
+/// offset 0, the manifest right after it, and the footer ending the file.
+/// Every byte of such a file except the footer is covered by the checksum.
+/// The general pack reader tolerates other layouts, which a checkpoint never
+/// has.
+pub fn ensure_checkpoint_layout(artifact: &Path) -> Result<smolvm_pack::format::PackFooter> {
+    let footer = smolvm_pack::packer::read_footer_from_sidecar(artifact)
+        .map_err(|error| Error::agent("read checkpoint footer", error.to_string()))?;
+    let len = std::fs::metadata(artifact)
+        .map_err(|error| Error::agent("inspect checkpoint artifact", error.to_string()))?
+        .len();
+    check_checkpoint_layout(&footer, len)?;
+    Ok(footer)
+}
+
+fn check_checkpoint_layout(footer: &smolvm_pack::format::PackFooter, len: u64) -> Result<()> {
+    let expected = footer
+        .assets_size
+        .checked_add(footer.manifest_size)
+        .and_then(|end| end.checked_add(smolvm_pack::format::FOOTER_SIZE as u64));
+    if footer.stub_size != 0
+        || footer.assets_offset != 0
+        || footer.manifest_offset != footer.assets_size
+        || expected != Some(len)
+    {
+        return Err(Error::agent(
+            "verify checkpoint layout",
+            "not a checkpoint layout: expected payload, manifest and footer with nothing between or after them",
+        ));
     }
     Ok(())
 }
@@ -1041,7 +1189,58 @@ pub(crate) fn capture_to_path_with_source_release(
         release_source,
         false,
         |_| Ok(()),
+        None,
     )
+}
+
+/// Retention of a capture's unpacked state in the node's prepared cache, handed
+/// back to the caller instead of run inline.
+///
+/// Retaining verifies and fsyncs the whole unpacked state, which costs about as
+/// much as the capture itself, and nothing waits on it: a restore that arrives
+/// first reads the packed artifact instead. The caller runs it once it has
+/// replied, while it still owns the artifact.
+pub(crate) struct DeferredRetain(Box<dyn FnOnce(&Path) + Send>);
+
+impl DeferredRetain {
+    /// Retain against `artifact`, which must still be the capture's output.
+    pub(crate) fn run(self, artifact: &Path) {
+        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        // One at a time, so bursts of captures do not stack multi-gigabyte fsyncs.
+        let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+        (self.0)(artifact)
+    }
+}
+
+fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path)
+}
+
+/// [`capture_to_path_with_source_release`], leaving prepared-cache retention
+/// to the caller.
+pub(crate) fn capture_to_path_deferring_retention(
+    name: &str,
+    output: &Path,
+    options: &CaptureOptions,
+    history: usize,
+    release_source: impl FnOnce(),
+) -> Result<(CaptureResult, Option<DeferredRetain>)> {
+    let mut deferred = None;
+    let result = capture_with_completion(
+        name,
+        output,
+        options,
+        history,
+        release_source,
+        false,
+        |_| Ok(()),
+        Some(&mut deferred),
+    )?;
+    Ok((result, deferred))
 }
 
 /// Durable lifecycle boundaries for an owner coordinating a pause.
@@ -1069,9 +1268,11 @@ pub fn capture_and_stop_to_path(
         || {},
         true,
         publish_resume_point,
+        None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn capture_with_completion(
     name: &str,
     output: &Path,
@@ -1080,6 +1281,7 @@ fn capture_with_completion(
     release_source: impl FnOnce(),
     stop_after_capture: bool,
     mut publish_resume_point: impl FnMut(PauseCaptureStage) -> Result<()>,
+    defer_retain: Option<&mut Option<DeferredRetain>>,
 ) -> Result<CaptureResult> {
     let started = std::time::Instant::now();
     let mut phase = started;
@@ -1089,13 +1291,10 @@ fn capture_with_completion(
             "stored checkpoints stage inside the store; omit staging_dir",
         ));
     }
-    if output
-        .extension()
-        .is_none_or(|extension| !extension.eq_ignore_ascii_case("smolcheckpoint"))
-    {
+    if !has_checkpoint_extension(output) {
         return Err(Error::config(
             "checkpoint machine",
-            "output must end in .smolcheckpoint",
+            "output must end in .checkpoint",
         ));
     }
     if output.exists() {
@@ -1178,6 +1377,15 @@ fn capture_with_completion(
     let staging_dir = temp_dir.path().join("staging");
     let mut collector = AssetCollector::new(staging_dir.clone())
         .map_err(|error| Error::agent("collect checkpoint assets", error.to_string()))?;
+    // Staging is only packed and discarded unless a store ingests it or the
+    // prepared cache retains it; then the host's asset files can be linked in.
+    if stored.is_none()
+        && !options
+            .prepared_cache_budget_bytes
+            .is_some_and(|bytes| bytes > 0)
+    {
+        collector = collector.with_linked_host_assets();
+    }
     collector
         .collect_libraries(&checkpoint_lib_dir(options)?)
         .map_err(|error| Error::agent("collect checkpoint libraries", error.to_string()))?;
@@ -1229,7 +1437,6 @@ fn capture_with_completion(
         && smolvm_pack::extract::shared_extract_enabled();
     let sparse_capable = cfg!(all(target_os = "linux", target_arch = "x86_64"))
         && options.store_dir.is_none()
-        && !retain
         && crate::agent::fork::control_socket_cmd(&control, "SAVE_SPARSE_CAPABILITIES")?.trim()
             == "OK sparse-stream-v1 ownership-v1";
     let max_memory_image = max_checkpoint_memory_image(vm.mem, vm.source_smolmachine.is_some())?;
@@ -1245,16 +1452,28 @@ fn capture_with_completion(
     // intact for the source to keep executing after the checkpoint.
     let use_deferred_save =
         !cfg!(all(target_os = "linux", target_arch = "x86_64")) || vm.source_smolmachine.is_none();
-    let command = if use_deferred_save {
-        "PREPARE_SAVE"
-    } else {
+    // A capture that stops the VM keeps it paused until the RAM is written, so
+    // libkrun can read RAM it cannot retain as a generation (a fork clone's)
+    // in place instead of falling back to a synchronous save.
+    let command = if !use_deferred_save {
         "SAVE"
+    } else if stop_after_capture {
+        "PREPARE_SAVE_HELD"
+    } else {
+        "PREPARE_SAVE"
     };
     let mut reply = crate::agent::fork::control_socket_cmd_with_timeout(
         &control,
         &format!("{command} {}", runtime_snapshot.display()),
         std::time::Duration::from_secs(30 * 60),
     )?;
+    if command == "PREPARE_SAVE_HELD" && reply.trim() == "ERR EINVAL unknown command" {
+        reply = crate::agent::fork::control_socket_cmd_with_timeout(
+            &control,
+            &format!("PREPARE_SAVE {}", runtime_snapshot.display()),
+            std::time::Duration::from_secs(30 * 60),
+        )?;
+    }
     let prepared = use_deferred_save && reply.starts_with("OK");
     tracing::info!(machine = name, command, reply = ?reply.trim(), "checkpoint memory protocol reply");
     if !prepared
@@ -1326,6 +1545,16 @@ fn capture_with_completion(
         ),
         None => None,
     };
+    // Retention needs the unpacked RAM image the streamed path never writes, so
+    // the stream writes it too: only the pages in use, beside the staging tree
+    // so packing does not pick it up. Sparse, it is a fraction of full RAM.
+    let prepared_memory = temp_dir.path().join("prepared-memory.bin");
+    if let Some(stream) = streamed_memory.as_mut().filter(|_| retain) {
+        match create_private_file(&prepared_memory) {
+            Ok(file) => stream.copy_memory_to(file),
+            Err(error) => tracing::warn!(%error, "streamed checkpoint will not be retained"),
+        }
+    }
 
     let mut stored = stored;
     let stored_memory = if let Some((_, writer)) = stored.as_mut() {
@@ -1643,6 +1872,14 @@ fn capture_with_completion(
         packer.pack_artifact(output).map(|info| (info, None))
     }
     .map_err(|error| Error::agent("pack checkpoint", error.to_string()))?;
+    // A streamed capture is retainable only once its RAM copy is complete.
+    #[cfg(target_os = "linux")]
+    let retain = retain
+        && streamed_memory
+            .as_ref()
+            .is_none_or(|stream| stream.memory_copied());
+    #[cfg(target_os = "linux")]
+    let streamed = streamed_memory.is_some();
     if streamed_memory.is_some() {
         pause.prepared_save = None;
         #[cfg(target_os = "linux")]
@@ -1651,23 +1888,36 @@ fn capture_with_completion(
     log_phase(name, "capture_pack", &mut phase);
     #[cfg(not(target_os = "linux"))]
     let _ = identity;
+    #[cfg(not(target_os = "linux"))]
+    let _ = defer_retain;
     #[cfg(target_os = "linux")]
-    if options
-        .prepared_cache_budget_bytes
-        .is_some_and(|bytes| bytes > 0)
-        && smolvm_pack::extract::shared_extract_enabled()
-    {
-        if let Err(error) = crate::artifact_cache::retain_prepared_checkpoint_with_identity(
-            output,
-            &staging_dir,
-            identity.as_ref(),
-        ) {
-            tracing::warn!(%error, "prepared checkpoint unavailable; durable artifact remains usable");
-        }
-        if let Err(error) = crate::artifact_cache::prune_prepared_checkpoints(
-            options.prepared_cache_budget_bytes.unwrap_or(0),
-        ) {
-            tracing::warn!(%error, "could not prune prepared checkpoints");
+    if retain {
+        let budget = options.prepared_cache_budget_bytes.unwrap_or(0);
+        let job = DeferredRetain(Box::new(move |artifact: &Path| {
+            if streamed {
+                if let Err(error) =
+                    std::fs::rename(&prepared_memory, snapshot_dir.join("memory.bin"))
+                {
+                    tracing::warn!(%error, "prepared checkpoint unavailable; durable artifact remains usable");
+                    return;
+                }
+            }
+            if let Err(error) = crate::artifact_cache::retain_prepared_checkpoint_with_identity(
+                artifact,
+                &staging_dir,
+                identity.as_ref(),
+            ) {
+                tracing::warn!(%error, "prepared checkpoint unavailable; durable artifact remains usable");
+            }
+            if let Err(error) = crate::artifact_cache::prune_prepared_checkpoints(budget) {
+                tracing::warn!(%error, "could not prune prepared checkpoints");
+            }
+            // The staging tree is consumed by retention or discarded here.
+            drop(temp_dir);
+        }));
+        match defer_retain {
+            Some(slot) => *slot = Some(job),
+            None => job.run(output),
         }
         log_phase(name, "capture_retain_prepared", &mut phase);
     }
@@ -3442,7 +3692,7 @@ pub fn install(
     if result.is_err() {
         let _ = std::fs::remove_dir_all(&partial);
         let _ = std::fs::remove_dir_all(&destination);
-        let _ = std::fs::remove_dir_all(vm_data_dir.join(READONLY_INPUT_DIR));
+        let _ = remove_readonly_input(vm_data_dir);
     }
     result
 }
@@ -3494,6 +3744,7 @@ pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
         ));
     }
     let footer = verified_sidecar_footer(artifact)?;
+    ensure_checkpoint_layout(artifact)?;
     let manifest = smolvm_pack::packer::read_manifest_from_sidecar(artifact)
         .map_err(|e| Error::agent("read paused checkpoint", e.to_string()))?;
     let checkpoint = manifest
@@ -3502,13 +3753,47 @@ pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
         .ok_or_else(|| Error::agent("resume machine", "artifact has no execution state"))?;
     validate_compatibility(checkpoint)?;
     let vm_data = crate::agent::vm_data_dir(&record.name);
-    let staged = tempfile::Builder::new()
-        .prefix("resume-")
-        .tempdir_in(&vm_data)?;
-    smolvm_pack::extract::extract_sidecar(artifact, staged.path(), &footer, false, false)
-        .map_err(|e| Error::agent("extract paused checkpoint", e.to_string()))?;
-    clear_stale_restore_state(&vm_data)?;
-    install(staged.path(), &vm_data, checkpoint)
+    // Resuming here uses this host's runtime, so the libraries, agent rootfs
+    // and storage template the artifact carries for other hosts stay packed.
+    let mut skip: Vec<PathBuf> = manifest
+        .assets
+        .libraries
+        .iter()
+        .map(|asset| PathBuf::from(&asset.path))
+        .collect();
+    skip.push(PathBuf::from("lib"));
+    skip.push(PathBuf::from(&manifest.assets.agent_rootfs.path));
+    if let Some(template) = &manifest.assets.storage_template {
+        skip.push(PathBuf::from(&template.path));
+    }
+    let extract_and_install = |parent: &Path| -> Result<()> {
+        let staged = tempfile::Builder::new()
+            .prefix("resume-")
+            .tempdir_in(parent)?;
+        smolvm_pack::extract::extract_checkpoint_sidecar(artifact, staged.path(), &footer, &skip)
+            .map_err(|e| Error::agent("extract paused checkpoint", e.to_string()))?;
+        clear_stale_restore_state(&vm_data)?;
+        install(staged.path(), &vm_data, checkpoint)
+    };
+    // Stage on tmpfs when there is room, so the RAM image handed to the VMM
+    // is never written to disk. Its RAM is freed once the VMM has read it.
+    #[cfg(target_os = "linux")]
+    if let Some(root) = restore_tmpfs_root() {
+        let needed = footer
+            .assets_size
+            .saturating_mul(4)
+            .saturating_add(64 << 20);
+        if free_bytes(&root).is_some_and(|free| free >= needed) {
+            match extract_and_install(&root) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    tracing::warn!(machine = %record.name, %error, "restore on tmpfs failed; staging on disk");
+                    clear_stale_restore_state(&vm_data)?;
+                }
+            }
+        }
+    }
+    extract_and_install(&vm_data)
 }
 
 /// Remove what an earlier restore left in a stopped machine's data dir before
@@ -3518,13 +3803,12 @@ pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
 /// and leaving it makes the new restore refuse to retain its own, so a machine
 /// restored from a checkpoint could be paused but never resumed.
 fn clear_stale_restore_state(vm_data: &Path) -> Result<()> {
-    for dir in [INSTALLED_DIR, READONLY_INPUT_DIR] {
-        match std::fs::remove_dir_all(vm_data.join(dir)) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
+    match std::fs::remove_dir_all(vm_data.join(INSTALLED_DIR)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
     }
+    remove_readonly_input(vm_data)?;
     match std::fs::remove_file(vm_data.join(RETAINED_MEMORY_BACKING)) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -3590,7 +3874,7 @@ fn consume_with_retained_backing(vm_data_dir: &Path, retain_memory: bool) -> Res
         Error::agent("consume checkpoint", error.to_string())
     })?;
     if readonly_input {
-        if let Err(error) = std::fs::remove_dir_all(vm_data_dir.join(READONLY_INPUT_DIR)) {
+        if let Err(error) = remove_readonly_input(vm_data_dir) {
             tracing::warn!(%error, "checkpoint consumed but retained RAM cleanup failed");
         }
     }
@@ -3603,6 +3887,54 @@ fn consume_with_retained_backing(vm_data_dir: &Path, retain_memory: bool) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkpoints_are_written_as_dot_checkpoint_and_the_earlier_name_still_works() {
+        for name in [
+            "a.checkpoint",
+            "A.CHECKPOINT",
+            "dir/a.checkpoint",
+            "a.smolcheckpoint",
+        ] {
+            assert!(has_checkpoint_extension(Path::new(name)), "{name}");
+        }
+        for name in ["a.smolmachine", "a", "a.checkpoint.tmp", "checkpoint"] {
+            assert!(!has_checkpoint_extension(Path::new(name)), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_checkpoint_has_nothing_outside_its_checksummed_bytes() {
+        let footer = smolvm_pack::format::PackFooter {
+            stub_size: 0,
+            assets_offset: 0,
+            assets_size: 1000,
+            manifest_offset: 1000,
+            manifest_size: 200,
+            checksum: 0,
+        };
+        let exact = 1000 + 200 + smolvm_pack::format::FOOTER_SIZE as u64;
+        assert!(check_checkpoint_layout(&footer, exact).is_ok());
+        assert!(
+            check_checkpoint_layout(&footer, exact + 1).is_err(),
+            "bytes between the manifest and the footer are not checksummed"
+        );
+        let shifted = smolvm_pack::format::PackFooter {
+            assets_offset: 8,
+            ..footer
+        };
+        assert!(check_checkpoint_layout(&shifted, exact).is_err());
+        let gap = smolvm_pack::format::PackFooter {
+            manifest_offset: 1008,
+            ..footer
+        };
+        assert!(check_checkpoint_layout(&gap, exact).is_err());
+        let stub = smolvm_pack::format::PackFooter {
+            stub_size: 4096,
+            ..footer
+        };
+        assert!(check_checkpoint_layout(&stub, exact).is_err());
+    }
 
     #[test]
     fn resuming_clears_the_memory_a_previous_restore_retained() {
@@ -3957,7 +4289,7 @@ mod tests {
     #[test]
     fn restore_checks_sidecar_checksum_before_manifest_or_machine_creation() {
         let temp = tempfile::tempdir().unwrap();
-        let artifact = temp.path().join("state.smolcheckpoint");
+        let artifact = temp.path().join("state.checkpoint");
         let manifest = PackManifest::new(
             "vm://checksum-test".into(),
             "none".into(),
@@ -3967,10 +4299,7 @@ mod tests {
         Packer::new(manifest).pack_artifact(&artifact).unwrap();
         let db = crate::db::SmolvmDb::open_at(&temp.path().join("test.db")).unwrap();
         let error = restore_from_path(&db, "checksum-test", &artifact).unwrap_err();
-        assert!(
-            error.to_string().contains("not a .smolcheckpoint"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("is not a checkpoint"), "{error}");
         let original = std::fs::read(&artifact).unwrap();
         let footer = smolvm_pack::packer::read_footer_from_sidecar(&artifact).unwrap();
         for offset in [0, footer.manifest_offset as usize] {

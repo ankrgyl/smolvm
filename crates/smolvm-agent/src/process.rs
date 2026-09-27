@@ -123,6 +123,99 @@ pub enum WaitResult {
 /// Returns `true` if the peer has closed OR the socket is in an error state.
 /// Returns `false` if the socket is still alive OR we can't determine (fail
 /// open — a bogus fd shouldn't cause us to kill a healthy child).
+/// Kill `child` and every process descended from it, then reap `child`.
+///
+/// A command run in an image container is not the agent's child: the agent
+/// spawns `crun exec` (or a namespace-entering helper) and the command is that
+/// helper's child. Killing only the direct child orphans the command, which
+/// keeps running in the container after its client disconnected or its timeout
+/// passed. The agent's PID namespace contains the container's, so the whole
+/// tree is visible in `/proc`.
+pub fn kill_child_tree(child: &mut Child) {
+    #[cfg(target_os = "linux")]
+    kill_descendants(child.id());
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// SIGKILL every live descendant of `root`.
+///
+/// The tree is frozen first: once an intermediate process dies its children are
+/// re-parented and no longer look like descendants, and a live process could
+/// fork between a walk and the kill. So SIGSTOP everything found, re-walk until
+/// no new process appears (a stopped process cannot fork), then SIGKILL the
+/// whole set. Bounded, so a fork bomb cannot pin the agent.
+#[cfg(target_os = "linux")]
+fn kill_descendants(root: u32) {
+    let mut frozen = std::collections::BTreeSet::new();
+    for _ in 0..32 {
+        let fresh: Vec<u32> = live_descendants(root)
+            .into_iter()
+            .filter(|pid| !frozen.contains(pid))
+            .collect();
+        if fresh.is_empty() {
+            break;
+        }
+        for pid in fresh {
+            // SAFETY: plain signal delivery to a PID read from /proc.
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) };
+            frozen.insert(pid);
+        }
+    }
+    for pid in frozen {
+        // SAFETY: as above. A stopped process still dies on SIGKILL.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    }
+}
+
+/// Live (non-zombie) descendants of `root`, read from `/proc`.
+#[cfg(target_os = "linux")]
+fn live_descendants(root: u32) -> Vec<u32> {
+    let mut children: std::collections::HashMap<u32, Vec<u32>> = Default::default();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        if let Some((state, ppid)) = parse_stat_state_ppid(&stat) {
+            if state != 'Z' {
+                children.entry(ppid).or_default().push(pid);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    let mut queue = vec![root];
+    while let Some(pid) = queue.pop() {
+        if let Some(kids) = children.get(&pid) {
+            for &kid in kids {
+                found.push(kid);
+                queue.push(kid);
+            }
+        }
+    }
+    found
+}
+
+/// `(state, ppid)` from a `/proc/<pid>/stat` line. The command name is in
+/// parentheses and may itself contain spaces or `)`, so fields are read after
+/// the LAST `)`.
+fn parse_stat_state_ppid(stat: &str) -> Option<(char, u32)> {
+    let rest = stat.get(stat.rfind(')')? + 1..)?;
+    let mut fields = rest.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    let ppid = fields.next()?.parse().ok()?;
+    Some((state, ppid))
+}
+
 #[cfg(target_os = "linux")]
 pub fn is_peer_closed(fd: std::os::unix::io::RawFd) -> bool {
     if fd < 0 {
@@ -356,6 +449,45 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stat_parsing_survives_odd_command_names() {
+        let stat = "4242 (weird) name)) S 17 4242 4242 0 -1 4194560 0 0";
+        assert_eq!(parse_stat_state_ppid(stat), Some(('S', 17)));
+        assert_eq!(parse_stat_state_ppid("7 (sh) Z 1 7"), Some(('Z', 1)));
+        assert_eq!(parse_stat_state_ppid("garbage"), None);
+    }
+
+    // The case that motivated it: the command is a GRANDCHILD (crun exec ->
+    // command -> its own children). Killing only the direct child used to leave
+    // the rest running.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kill_child_tree_kills_grandchildren() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sh -c 'sleep 30 & sleep 30 & wait' & wait"])
+            .spawn()
+            .unwrap();
+        // Let the tree form.
+        let mut tree = Vec::new();
+        for _ in 0..50 {
+            tree = live_descendants(child.id());
+            if tree.len() >= 3 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(tree.len() >= 3, "expected sh + two sleeps, got {tree:?}");
+        kill_child_tree(&mut child);
+        std::thread::sleep(Duration::from_millis(100));
+        for pid in tree {
+            let alive = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|s| parse_stat_state_ppid(&s))
+                .is_some_and(|(state, _)| state != 'Z');
+            assert!(!alive, "descendant {pid} survived");
+        }
+    }
 
     #[test]
     fn test_timeout_exit_code_value() {

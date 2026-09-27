@@ -139,6 +139,9 @@ pub struct MachineEntry {
     pub image: Option<String>,
     /// Credential policy launch description, when the machine has one.
     pub credentials: Option<crate::credentials::CredentialLaunch>,
+    /// API-provided interceptor binding retained only in this server process
+    /// so automatic and implicit restarts can rebind without persisting a token.
+    pub external_interceptor: Option<smolvm_protocol::InterceptEndpoint>,
     /// The agent manager for this machine.
     pub manager: AgentManager,
     /// Host mounts configured for this machine.
@@ -216,6 +219,9 @@ pub struct MachineRegistration {
     /// Secret refs to attach to this machine (from a Smolfile or
     /// `CreateMachineRequest.secrets`).
     pub secret_refs: std::collections::BTreeMap<String, smolvm_protocol::SecretRef>,
+    /// Placeholders a restored checkpoint's workload already holds for its
+    /// credential bindings. Empty mints fresh ones.
+    pub credential_placeholders: std::collections::BTreeMap<String, String>,
 }
 
 /// RAII guard for machine name reservation.
@@ -550,6 +556,7 @@ impl ApiState {
                                 &record.name,
                                 &record,
                             ),
+                            external_interceptor: None,
                             manager,
                             mounts,
                             ports,
@@ -1059,11 +1066,18 @@ impl ApiState {
         record.allowed_cidrs = reg.resources.allowed_cidrs.clone();
         record.dns_filter_hosts = reg.resources.allowed_hosts.clone();
         if let Some(policy) = reg.resources.credentials.clone().filter(|p| !p.is_empty()) {
-            record.credential_placeholders = crate::credentials::prepare_policy(
-                &policy,
-                reg.resources.allowed_hosts.as_deref(),
-            )?;
+            record.credential_placeholders = if reg.credential_placeholders.is_empty() {
+                crate::credentials::prepare_policy(&policy, reg.resources.allowed_hosts.as_deref())?
+            } else {
+                policy
+                    .validate(reg.resources.allowed_hosts.as_deref())
+                    .map_err(|e| ApiError::BadRequest(format!("credentials: {e}")))?;
+                reg.credential_placeholders.clone()
+            };
             record.credential_policy = Some(policy);
+            // Bindings from an API caller are never resolved from this host's
+            // environment; their values arrive over the API.
+            record.credentials_supplied_by_api = true;
         }
         record.network_backend = reg.resources.network_backend;
         record.guest_subnet = reg.resources.guest_subnet.clone();
@@ -1120,6 +1134,7 @@ impl ApiState {
                             &record.name,
                             &record,
                         ),
+                        external_interceptor: None,
                         manager: reg.manager,
                         mounts: reg.mounts,
                         ports: reg.ports,
@@ -1443,6 +1458,7 @@ pub async fn ensure_machine_running(
         features.cuda_fork_pool_size = entry.cuda_fork_pool_size;
         features.cuda_vram_limit_mib = entry.cuda_vram_limit_mib;
         features.forkable = entry.forkable;
+        features.external_interceptor = entry.external_interceptor;
         entry
             .manager
             .ensure_running_via_subprocess(mounts, ports, resources, features)?;
@@ -1450,6 +1466,19 @@ pub async fn ensure_machine_running(
     })
     .await
     .map_err(|e| crate::Error::agent("ensure running", e.to_string()))?
+}
+
+/// A paused machine must be resumed, never booted fresh: an implicit start
+/// (exec, files, images) would discard its saved execution and leave it unable
+/// to resume or pause again. Explicit start refuses the same way.
+fn refuse_implicit_start_of_paused(record: &crate::config::VmRecord) -> crate::Result<()> {
+    if record.paused_checkpoint.is_some() {
+        return Err(crate::Error::agent_conflict(
+            "start machine",
+            "machine has saved execution; use resume",
+        ));
+    }
+    Ok(())
 }
 
 /// Ensure a machine is running and persist the Running state to the database.
@@ -1481,6 +1510,7 @@ pub async fn ensure_running_and_persist(
     // running machines, so a running machine's entry can't be stale — and for
     // one, ensure_machine_running early-returns before the config matters.
     if let Ok(Some(record)) = state.lookup_vm(name).await {
+        refuse_implicit_start_of_paused(&record)?;
         let mut e = entry.lock();
         e.mounts = record.host_mounts().iter().map(MountSpec::from).collect();
         e.ports = record
@@ -1497,6 +1527,9 @@ pub async fn ensure_running_and_persist(
         e.forkable = record.forkable_on_start();
         e.cuda_fork_pool_size = record.cuda_fork_pool_size;
         e.cuda_vram_limit_mib = record.cuda_vram_limit_mib;
+        if !record.external_interceptor_required {
+            e.external_interceptor = None;
+        }
     }
 
     let freshly_booted = ensure_machine_running(entry).await?;
@@ -1831,6 +1864,19 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn implicit_start_refuses_a_machine_with_saved_execution() {
+        let mut record =
+            crate::config::VmRecord::new("paused".into(), 1, 512, vec![], vec![], false);
+        assert!(refuse_implicit_start_of_paused(&record).is_ok());
+        record.paused_checkpoint = Some("/saved/execution".into());
+        let error = refuse_implicit_start_of_paused(&record).unwrap_err();
+        assert!(matches!(
+            crate::api::ApiError::from(error),
+            crate::api::ApiError::Conflict(_)
+        ));
+    }
     use futures_util::FutureExt as _;
     use tempfile::TempDir;
 
@@ -1964,6 +2010,7 @@ mod tests {
             name,
             MachineEntry {
                 credentials: None,
+                external_interceptor: None,
                 manager: AgentManager::for_vm(name).unwrap(),
                 image: None,
                 mounts: vec![],
@@ -2025,6 +2072,7 @@ mod tests {
             "remove-test-m1",
             MachineEntry {
                 credentials: None,
+                external_interceptor: None,
                 manager,
                 image: None,
                 mounts: vec![],
@@ -2097,6 +2145,7 @@ mod tests {
             "busy-m1",
             MachineEntry {
                 credentials: None,
+                external_interceptor: None,
                 manager,
                 image: None,
                 mounts: vec![],

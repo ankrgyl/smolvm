@@ -820,6 +820,37 @@ pub struct AgentManager {
     inner: Arc<Mutex<AgentInner>>,
 }
 
+/// Apply the persistent fail-closed policy before spawning a named VM. Every
+/// launch path funnels through `start_via_subprocess`, including API restarts.
+fn reject_missing_external_interceptor(
+    record: &crate::config::VmRecord,
+    endpoint: Option<&smolvm_protocol::InterceptEndpoint>,
+) -> Result<()> {
+    if record.external_interceptor_required && endpoint.is_none() {
+        return Err(Error::config(
+            "egress interceptor",
+            "this machine requires an external interceptor on every start; pass --egress-interceptor and set SMOLVM_INTERCEPTOR_TOKEN",
+        ));
+    }
+    Ok(())
+}
+
+fn enforce_external_interceptor_requirement(
+    db: &crate::db::SmolvmDb,
+    name: &str,
+    endpoint: Option<&smolvm_protocol::InterceptEndpoint>,
+) -> Result<()> {
+    if let Some(record) = db.get_vm(name)? {
+        reject_missing_external_interceptor(&record, endpoint)?;
+        if endpoint.is_some() && !record.external_interceptor_required {
+            // Persist before spawning the VMM. If the caller or boot fails,
+            // every later start still requires interception.
+            db.update_vm(name, |record| record.external_interceptor_required = true)?;
+        }
+    }
+    Ok(())
+}
+
 impl AgentManager {
     /// Create a new agent manager with explicit paths (low-level).
     ///
@@ -1659,6 +1690,14 @@ impl AgentManager {
         };
 
         if needs_restart {
+            if let Some(name) = self.name() {
+                if let Some(record) = crate::db::SmolvmDb::open()?.get_vm(name)? {
+                    reject_missing_external_interceptor(
+                        &record,
+                        features.external_interceptor.as_ref(),
+                    )?;
+                }
+            }
             tracing::info!("restarting agent VM due to configuration change");
             self.stop()?;
         } else {
@@ -2071,7 +2110,7 @@ impl AgentManager {
 
         let t_launch = Instant::now();
 
-        // A machine created from a `.smolcheckpoint` carries a private,
+        // A machine created from a checkpoint carries a private,
         // one-shot restore directory in its data dir. Discover it centrally so
         // CLI, API, SDK, implicit exec starts, and restart paths cannot drift.
         // An explicit live-fork snapshot always wins.
@@ -2084,6 +2123,28 @@ impl AgentManager {
             }
         }
 
+        if let Some(endpoint) = &features.external_interceptor {
+            launcher::validate_external_interceptor(
+                endpoint,
+                &resources,
+                features.credentials.is_some(),
+                features.pod_netns.is_some(),
+            )?;
+            if features.snapshot_dir.is_some() || features.forkable {
+                return Err(Error::config(
+                    "egress interceptor",
+                    "external interception does not support checkpoint or branch launches",
+                ));
+            }
+        }
+        if let Some(name) = self.name() {
+            let db = crate::db::SmolvmDb::open()?;
+            enforce_external_interceptor_requirement(
+                &db,
+                name,
+                features.external_interceptor.as_ref(),
+            )?;
+        }
         if let Some(snapshot) = features.snapshot_dir.as_deref() {
             crate::portable_checkpoint::prepare_memory_backend(snapshot, features.forkable)?;
         }
@@ -2402,6 +2463,14 @@ impl AgentManager {
             None
         };
 
+        // Supplied credential values ride in the boot process's own
+        // environment, never in the boot config written below.
+        let credential_env = features
+            .credentials
+            .as_mut()
+            .map(|launch| launch.child_env())
+            .unwrap_or_default();
+
         // Write boot config to a file the subprocess will read
         let config = BootConfig {
             rootfs_path: self.rootfs_path.clone(),
@@ -2423,6 +2492,7 @@ impl AgentManager {
             published_sockets: features.published_sockets,
             dns_filter_hosts: features.dns_filter_hosts,
             credentials: features.credentials,
+            external_interceptor: features.external_interceptor,
             packed_layers_dir: features.packed_layers_dir,
             pack_idmap_source,
             extra_disks: {
@@ -2464,8 +2534,13 @@ impl AgentManager {
             .join("boot-config.json");
         let config_json = serde_json::to_vec(&config)
             .map_err(|e| Error::agent("serialize boot config", e.to_string()))?;
-        std::fs::write(&config_path, &config_json)
+        let mut config_file = tempfile::NamedTempFile::new_in(config_path.parent().unwrap())
+            .map_err(|e| Error::agent("create boot config", e.to_string()))?;
+        std::io::Write::write_all(&mut config_file, &config_json)
             .map_err(|e| Error::agent("write boot config", e.to_string()))?;
+        config_file
+            .persist(&config_path)
+            .map_err(|e| Error::agent("persist boot config", e.to_string()))?;
         tracing::info!(
             elapsed_ms = t_launch.elapsed().as_millis(),
             "boot: config written"
@@ -2540,7 +2615,14 @@ impl AgentManager {
                 }
             }
         }
+        for (var, value) in &credential_env {
+            match value {
+                Some(value) => cmd.env(var, value.as_str()),
+                None => cmd.env_remove(var),
+            };
+        }
         cmd.args(["_boot-vm", &config_path.to_string_lossy()])
+            .env_remove("SMOLVM_INTERCEPTOR_TOKEN")
             .env(
                 "SMOLVM_BOOT_WATCH_PARENT",
                 if watch_parent { "1" } else { "0" },
@@ -2707,6 +2789,14 @@ impl AgentManager {
         };
 
         if needs_restart {
+            if let Some(name) = self.name() {
+                if let Some(record) = crate::db::SmolvmDb::open()?.get_vm(name)? {
+                    reject_missing_external_interceptor(
+                        &record,
+                        features.external_interceptor.as_ref(),
+                    )?;
+                }
+            }
             tracing::info!("restarting agent VM due to configuration change");
             self.stop()?;
         } else {
@@ -2780,11 +2870,25 @@ impl AgentManager {
 
             // Process identity is not proof that guest writes reached disk. A slow
             // flush must not turn a graceful stop into an unannounced power cut.
-            if !acked && process::is_alive(pid) {
-                return Err(Error::agent(
-                    "stop agent",
-                    format!("guest did not confirm filesystem synchronization; left the VM alive for retry: {}", shutdown.unwrap_err()),
-                ));
+            // EOF can precede process exit. Observe only: missing acknowledgment
+            // never permits a signal, and process death is not filesystem-sync
+            // confirmation.
+            if let Err(error) = shutdown {
+                let exited = !process::is_alive(pid)
+                    || (process::is_our_process_strict(pid, start_time)
+                        && process::poll_for_exit(pid, AGENT_STOP_TIMEOUT).is_some()
+                        && !process::is_alive(pid));
+                if !exited {
+                    return Err(Error::agent(
+                        "stop agent",
+                        format!("guest did not confirm filesystem synchronization; left the VM alive for retry: {error}"),
+                    ));
+                }
+                tracing::warn!(
+                    pid, %error,
+                    "VM exited without shutdown acknowledgment; filesystem synchronization unconfirmed"
+                );
+                return Ok(());
             }
             acked
         };
@@ -3537,6 +3641,34 @@ fn boot_failure_reason(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn intercepted_machine_cannot_relaunch_without_an_interceptor() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = crate::db::SmolvmDb::open_at(&temp.path().join("smolvm.db")).unwrap();
+        let record = crate::config::VmRecord::new("worker".into(), 1, 512, vec![], vec![], true);
+        db.insert_vm("worker", &record).unwrap();
+
+        // Existing records and ordinary machines remain bootable.
+        enforce_external_interceptor_requirement(&db, "worker", None).unwrap();
+        let endpoint = smolvm_protocol::InterceptEndpoint {
+            addr: "127.0.0.1:43123".parse().unwrap(),
+            token: [7; smolvm_protocol::intercept::TOKEN_LEN],
+        };
+        enforce_external_interceptor_requirement(&db, "worker", Some(&endpoint)).unwrap();
+        assert!(
+            db.get_vm("worker")
+                .unwrap()
+                .unwrap()
+                .external_interceptor_required
+        );
+
+        let error = enforce_external_interceptor_requirement(&db, "worker", None).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("requires an external interceptor"));
+        enforce_external_interceptor_requirement(&db, "worker", Some(&endpoint)).unwrap();
+    }
+
     /// A frozen fork base is snapshot-paused, so no shutdown acknowledgement is
     /// ever coming. Waiting for one and then refusing to stop is how such a
     /// machine became unstoppable: `exec` and `start` both told the caller to

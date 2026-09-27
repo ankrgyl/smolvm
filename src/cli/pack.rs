@@ -25,6 +25,16 @@ use smolvm_protocol::AgentResponse;
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
 
+/// Floor for the temporary pack VM's storage disk (GiB). Matches the export
+/// helper's floor: a realistic image pull plus the agent rootfs needs more
+/// than the 20 GiB machine default.
+const PACK_VM_MIN_STORAGE_GIB: u64 = 64;
+
+/// Multiplier on an image's compressed layer total when sizing the pack VM's
+/// storage disk. Extraction inflates gzip'd layers ~3×; the rest is margin —
+/// the disk is sparse, so over-sizing costs nothing on the host.
+const PACK_VM_STORAGE_FACTOR: u64 = 8;
+
 /// Package and run self-contained VM executables.
 #[derive(Subcommand, Debug)]
 pub enum PackCmd {
@@ -61,7 +71,7 @@ impl PackCmd {
 }
 
 /// Persist one running machine, including RAM and execution state, as a
-/// portable `.smolcheckpoint` artifact.
+/// portable `.checkpoint` file.
 #[derive(Args, Debug)]
 pub struct CheckpointCmd {
     /// Running machine to checkpoint.
@@ -95,7 +105,7 @@ pub struct CheckpointCmd {
     #[arg(long, value_name = "DIR")]
     pub store: Option<PathBuf>,
 
-    /// Destination `.smolcheckpoint` file (directory with --store).
+    /// Destination `.checkpoint` file (directory with --store).
     #[arg(short = 'o', long, value_name = "PATH")]
     pub output: PathBuf,
 
@@ -368,6 +378,14 @@ pub struct PackCreateCmd {
     #[arg(long, value_name = "MiB")]
     pub mem: Option<u32>,
 
+    /// Storage disk size in GiB for the temporary pack VM that pulls and
+    /// flattens the image. When omitted, the disk is sized from the image's
+    /// registry manifest (compressed layer total × headroom, floored at
+    /// [`PACK_VM_MIN_STORAGE_GIB`], which is also used when the manifest
+    /// can't be probed); pass this to override the estimate.
+    #[arg(long, value_name = "GiB")]
+    pub storage: Option<u64>,
+
     /// Target OCI platform for multi-arch images (e.g., linux/arm64, linux/amd64)
     ///
     /// By default, uses the host architecture. Use this to override, for example
@@ -426,6 +444,57 @@ pub struct PackCreateCmd {
 }
 
 impl PackCreateCmd {
+    /// Storage disk size (GiB) for the temporary pack VM.
+    ///
+    /// `--storage` wins; otherwise the image's registry manifest is probed
+    /// host-side and the disk is sized at `compressed ×
+    /// PACK_VM_STORAGE_FACTOR`, floored at `PACK_VM_MIN_STORAGE_GIB`. The
+    /// factor covers gzip's ~3× expansion on extraction plus margin; the floor
+    /// matches the export helper's. When the manifest can't be probed (offline
+    /// registry, local image source) the floor is used: the disk is sparse, so
+    /// over-sizing is free, while under-sizing fails the pull mid-way.
+    fn pack_vm_storage_gib(&self, image: &str, oci_platform: Option<&str>) -> u64 {
+        if let Some(gib) = self.storage {
+            return gib;
+        }
+        if smolvm::data::image_source::is_local_ref(image) {
+            return PACK_VM_MIN_STORAGE_GIB;
+        }
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt,
+            Err(e) => {
+                warn!(error = %e, "cannot create runtime for image size probe; using the storage floor");
+                return PACK_VM_MIN_STORAGE_GIB;
+            }
+        };
+        match rt.block_on(smolvm::image_store::image_compressed_size(
+            image,
+            &smolvm::registry::PullAuth::FromConfig,
+            oci_platform,
+        )) {
+            Ok(compressed_bytes) => {
+                let compressed_gib = compressed_bytes.div_ceil(smolvm::data::consts::BYTES_PER_GIB);
+                let gib = compressed_gib
+                    .saturating_mul(PACK_VM_STORAGE_FACTOR)
+                    .max(PACK_VM_MIN_STORAGE_GIB);
+                info!(
+                    image = %image,
+                    compressed_gib, gib,
+                    "sized pack VM storage from image manifest"
+                );
+                gib
+            }
+            Err(e) => {
+                warn!(
+                    image = %image,
+                    error = %e,
+                    "image size probe failed; using the pack VM storage floor"
+                );
+                PACK_VM_MIN_STORAGE_GIB
+            }
+        }
+    }
+
     /// Resolve the directory under which the staging temp dir is created.
     ///
     /// Precedence: `--staging-dir` → `SMOLVM_PACK_STAGING` → the disk-backed
@@ -596,7 +665,13 @@ impl PackCreateCmd {
         }
 
         println!("Starting agent VM...");
-        let manager = AgentManager::for_vm_with_sizes(&pack_vm_name, None, None)?;
+        // Size the pack VM's storage disk for the image it has to hold. The
+        // default 20 GiB cannot fit a CI-scale image's extracted layers, and
+        // the disk cannot grow after boot — so the registry manifest (the only
+        // pre-pull bound on pull size) sets the floor here.
+        let pack_storage_gib =
+            Some(self.pack_vm_storage_gib(&image, pack_config.oci_platform.as_deref()));
+        let manager = AgentManager::for_vm_with_sizes(&pack_vm_name, pack_storage_gib, None)?;
         manager.start_with_config(
             Vec::new(),
             VmResources {
@@ -610,7 +685,7 @@ impl PackCreateCmd {
                 gpu: false,
                 nested_virt: false,
                 cuda: false,
-                storage_gib: None,
+                storage_gib: pack_storage_gib,
                 overlay_gib: None,
                 block_io: Default::default(),
                 disks: Vec::new(),
@@ -2080,6 +2155,7 @@ mod tests {
             output: PathBuf::from("test-output"),
             cpus: Some(2),
             mem: Some(1024),
+            storage: None,
             oci_platform: None,
             entrypoint: None,
             no_sign: false,

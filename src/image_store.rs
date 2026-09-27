@@ -30,7 +30,7 @@ use crate::{Error, Result};
 /// The registry authorizes `repository:<repo>:pull` for the caller's credentials
 /// during resolution; an unauthorized caller is rejected here.
 pub async fn authorized_digest(reference: &str, auth: &PullAuth) -> Result<String> {
-    let (_client, _repo, manifest_bytes) = resolve_manifest(reference, auth).await?;
+    let (_client, _repo, manifest_bytes) = resolve_manifest(reference, auth, None).await?;
     Ok(manifest_digest(&manifest_bytes))
 }
 
@@ -55,7 +55,7 @@ pub struct ImageRunConfig {
 /// authorizes the pull during manifest resolution — plus one small config-blob
 /// fetch. No image layers are pulled.
 pub async fn authorized_image_config(reference: &str, auth: &PullAuth) -> Result<ImageRunConfig> {
-    let (client, repo, manifest_bytes) = resolve_manifest(reference, auth).await?;
+    let (client, repo, manifest_bytes) = resolve_manifest(reference, auth, None).await?;
     let digest = manifest_digest(&manifest_bytes);
     let manifest: OciManifest = serde_json::from_slice(&manifest_bytes)
         .map_err(|e| Error::agent("parse image manifest", e.to_string()))?;
@@ -72,17 +72,45 @@ pub async fn authorized_image_config(reference: &str, auth: &PullAuth) -> Result
     })
 }
 
+/// Resolve `reference` to its platform manifest and return the summed
+/// `layers[].size` — the image's total COMPRESSED footprint, authorized with
+/// `auth`. `oci_platform` selects the index entry the way the guest's pull
+/// would (`None` = this host's architecture, matching `authorized_digest`).
+///
+/// Callers use this to provision for an image BEFORE it is pulled: the
+/// manifest is the only pre-pull bound on how much data the pull will write.
+/// The returned bytes are compressed; extraction inflates them.
+pub async fn image_compressed_size(
+    reference: &str,
+    auth: &PullAuth,
+    oci_platform: Option<&str>,
+) -> Result<u64> {
+    let (_client, _repo, manifest_bytes) = resolve_manifest(reference, auth, oci_platform).await?;
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+        .map_err(|e| Error::agent("image-size", format!("bad manifest JSON: {e}")))?;
+    let layers = manifest["layers"].as_array().ok_or_else(|| {
+        Error::agent(
+            "image-size",
+            "resolved manifest has no layers array".to_string(),
+        )
+    })?;
+    Ok(layers.iter().map(|l| l["size"].as_u64().unwrap_or(0)).sum())
+}
+
 fn manifest_digest(manifest_bytes: &[u8]) -> String {
     format!("sha256:{}", hex::encode(Sha256::digest(manifest_bytes)))
 }
 
 /// The winning registry client, its repo path, and the resolved (single-
-/// platform) manifest bytes for `reference`. Shared by [`authorized_digest`] and
-/// [`authorized_image_config`] so both authorize identically and so the config
-/// fetch reuses the same client/repo that resolved the manifest.
+/// platform) manifest bytes for `reference`. Shared by [`authorized_digest`],
+/// [`authorized_image_config`] and [`image_compressed_size`] so all authorize
+/// identically and so the config fetch reuses the same client/repo that
+/// resolved the manifest. `oci_platform` selects an index entry; `None` is this
+/// host's architecture.
 async fn resolve_manifest(
     reference: &str,
     auth: &PullAuth,
+    oci_platform: Option<&str>,
 ) -> Result<(RegistryClient, String, Vec<u8>)> {
     let parsed = Reference::parse(reference)
         .map_err(|e| Error::config("image-auth", format!("bad reference: {}", e.reason)))?;
@@ -95,28 +123,31 @@ async fn resolve_manifest(
     // config the in-guest pull consults.
     let config = crate::SmolSettings::load()?.images;
 
-    // Resolve the registry the way the GUEST does — via `registry_pull_hosts`, not
-    // the configured default — so the host-side gate targets the same registry the
-    // in-guest pull would (a bare `alpine` is Docker Hub, not the smol registry).
-    let mut first_err: Option<String> = None;
-    for host in &crate::registry::registry_pull_hosts(reference) {
-        let client = registry_client(host, &config, auth);
-        let repo = repo_for(host, &parsed);
-        match client.get_manifest_resolved(&repo, &want).await {
-            Ok(manifest_bytes) => return Ok((client, repo, manifest_bytes)),
-            // Keep the FIRST failure. `registry_pull_hosts` is a DNS allow-list,
-            // not a list of real endpoints — Docker Hub yields
-            // ["docker.io", "docker.com"] — so letting the later marketing-host
-            // failure overwrite the real 401/429 would surface a nonsense error.
-            Err(e) => {
-                let _ = first_err.get_or_insert_with(|| e.to_string());
-            }
-        }
+    // Ask the reference's own registry, as the in-guest pull does. Not
+    // `registry_pull_hosts`: that is an egress allow-list of DNS apexes (Docker
+    // Hub's includes its `docker.com` blob CDN, whose website answers any path
+    // with a 200 page), and querying it masked the real 401/404/429.
+    let host = crate::registry::extract_registry(reference);
+    let client = registry_client(&host, &config, auth);
+    let repo = repo_for(&host, &parsed);
+    let platform = oci_platform.map(smolvm_registry::OciPlatform::parse);
+    let manifest_bytes = match &platform {
+        Some(p) => client.get_manifest_resolved_platform(&repo, &want, p).await,
+        None => client.get_manifest_resolved(&repo, &want).await,
     }
-    Err(Error::agent(
-        "image-auth",
-        first_err.unwrap_or_else(|| "no candidate registry resolved the image".to_string()),
-    ))
+    .map_err(|e| Error::agent("image-auth", e.to_string()))?;
+    // A manifest is a JSON object. Anything else is not from a registry, and
+    // must not be hashed into a digest or trusted as one.
+    if !matches!(
+        serde_json::from_slice::<serde_json::Value>(&manifest_bytes),
+        Ok(serde_json::Value::Object(_))
+    ) {
+        return Err(Error::agent(
+            "image-auth",
+            format!("{host} did not return an image manifest for {reference}"),
+        ));
+    }
+    Ok((client, repo, manifest_bytes))
 }
 
 /// The slice of an OCI image config blob the run path needs: its default
@@ -144,7 +175,7 @@ struct OciImageConfigInner {
 fn repo_for(host: &str, r: &Reference) -> String {
     let docker_hub = matches!(
         host,
-        "docker.io" | "docker.com" | "index.docker.io" | "registry-1.docker.io"
+        "docker.io" | "index.docker.io" | "registry-1.docker.io"
     );
     match &r.namespace {
         Some(ns) => format!("{}/{}", ns, r.name),
@@ -218,6 +249,62 @@ mod tests {
                 format!("sha256:{}", hex::encode(Sha256::digest(&body))),
                 "the digest is the content address of the manifest"
             );
+        });
+    }
+
+    /// A host that answers 200 with something other than a manifest, like the
+    /// web page Docker Hub's `docker.com` returns for any path, is not a
+    /// registry: its body must never become a digest.
+    #[test]
+    fn non_manifest_response_is_rejected() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/myrepo/manifests/latest"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/html")
+                        .set_body_string("<!doctype html><title>Docker</title>"),
+                )
+                .mount(&server)
+                .await;
+            let host = server.uri().strip_prefix("http://").unwrap().to_string();
+            let err = authorized_digest(&format!("{host}/myrepo:latest"), &PullAuth::Anonymous)
+                .await
+                .expect_err("a web page is not a manifest");
+            assert!(
+                err.to_string().contains("did not return an image manifest"),
+                "{err}"
+            );
+        });
+    }
+
+    /// The registry's own failure reaches the caller: nothing else is asked
+    /// that could replace a real "not found" with an unrelated error.
+    #[test]
+    fn registry_error_is_reported_as_is() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/myrepo/manifests/no-such-tag"))
+                .respond_with(ResponseTemplate::new(404))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let host = server.uri().strip_prefix("http://").unwrap().to_string();
+            let err =
+                authorized_digest(&format!("{host}/myrepo:no-such-tag"), &PullAuth::Anonymous)
+                    .await
+                    .expect_err("a missing tag must fail");
+            assert!(err.to_string().contains("myrepo:no-such-tag"), "{err}");
         });
     }
 

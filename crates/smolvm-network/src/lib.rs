@@ -91,6 +91,7 @@ use queues::NetworkFrameQueues;
 use queues::DEFAULT_FRAME_QUEUE_CAPACITY;
 use stack::{start_network_stack, VirtioPollConfig};
 use tcp_listeners::create_tcp_channel;
+pub use tcp_listeners::BoundPublishedPorts;
 use tcp_listeners::TcpPortListeners;
 
 /// Default upstream DNS resolver used by the gateway runtime.
@@ -156,10 +157,9 @@ pub struct GuestNetworkConfig {
     pub upstream_dns: Ipv4Addr,
     /// Optional dedicated host service reachable only through the gateway IP.
     pub host_service: Option<GatewayHostService>,
-    /// Credential interceptor for this machine. When set, guest HTTPS flows are
-    /// dialed to this loopback endpoint (prefixed with an authenticated
-    /// preamble naming the real destination) instead of the destination itself.
-    pub intercept: Option<InterceptEndpoint>,
+    /// Host interceptor and the outbound streams routed through it. Each stream
+    /// carries an authenticated preamble naming its original destination.
+    pub intercept: Option<StreamInterception>,
 }
 
 /// Exact guest gateway port mapped to one smolvm-owned host loopback port.
@@ -291,6 +291,22 @@ impl GuestNetworkConfig {
 
 pub use smolvm_protocol::InterceptEndpoint;
 
+/// Which admitted guest streams must pass through the host interceptor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamInterception {
+    /// Intercept HTTPS on port 443, preserving direct access to gateway services.
+    Https(InterceptEndpoint),
+    /// Route every outbound TCP flow; DNS remains host-managed and other
+    /// outbound datagrams are denied.
+    AllTcp(InterceptEndpoint),
+}
+
+impl StreamInterception {
+    pub(crate) fn all_tcp(&self) -> bool {
+        matches!(self, Self::AllTcp(_))
+    }
+}
+
 /// Filename of the per-VM egress denial audit log, created beside the vsock
 /// socket by the launcher and read back by the host's `read_egress_denials`.
 pub const EGRESS_DENIALS_LOG: &str = "egress-denials.log";
@@ -407,8 +423,8 @@ pub struct VirtioNetworkRuntime {
 ///   `krun_add_net_unixstream()` setup path.
 /// - `guest_network`: the static guest/gateway addressing and MAC plan for this
 ///   NIC.
-/// - `published_ports`: host->guest TCP port mappings that should be serviced
-///   directly by the virtio runtime instead of TSI.
+/// - `published_ports`: host->guest TCP port mappings, bound by the caller with
+///   [`BoundPublishedPorts::bind`], that the virtio runtime services instead of TSI.
 ///
 /// High-level flow:
 ///
@@ -450,10 +466,16 @@ pub struct VirtioNetworkRuntime {
 pub fn start_virtio_network(
     host_stream: Socket,
     guest_network: GuestNetworkConfig,
-    published_ports: &[PortMapping],
+    published_ports: BoundPublishedPorts,
     egress: EgressPolicy,
     fabric_lease: Option<fabric::FabricLease>,
 ) -> io::Result<VirtioNetworkRuntime> {
+    if guest_network.intercept.is_some_and(|mode| mode.all_tcp()) && fabric_lease.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "external interception cannot use a named network",
+        ));
+    }
     virtio_net_log!(
         "virtio-net: starting runtime guest_ip={} gateway_ip={} dns_server={}",
         guest_network.guest_ip,

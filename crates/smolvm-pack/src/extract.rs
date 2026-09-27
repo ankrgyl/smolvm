@@ -835,6 +835,19 @@ fn safe_unpack_with_policy<R: Read>(
     checkpoint: bool,
     owner_xattr: bool,
 ) -> std::io::Result<UnpackReport> {
+    safe_unpack_skipping(archive, dest, limits, checkpoint, owner_xattr, &[])
+}
+
+/// [`safe_unpack_with_policy`], leaving out the archive paths in `skip` and
+/// everything under them.
+fn safe_unpack_skipping<R: Read>(
+    archive: &mut tar::Archive<R>,
+    dest: &Path,
+    limits: &SafeUnpackLimits,
+    checkpoint: bool,
+    owner_xattr: bool,
+    skip: &[PathBuf],
+) -> std::io::Result<UnpackReport> {
     let mut report = UnpackReport::default();
     // Use `normalize_path` (not `canonicalize`) for the containment base so it
     // matches the per-entry `normalized` paths, which are built from this same
@@ -874,6 +887,12 @@ fn safe_unpack_with_policy<R: Read>(
         let mut entry = entry_result?;
         let entry_type = entry.header().entry_type();
         let entry_path = entry.path()?.to_path_buf();
+        if skip
+            .iter()
+            .any(|skip| normalize_path(&entry_path).starts_with(skip))
+        {
+            continue;
+        }
         // RAM is a host runtime input, not a guest filesystem entry. Never
         // restore the exporting VMM's UID onto this shared cache object.
         let host_memory =
@@ -2436,6 +2455,64 @@ fn upgrade_staged_layers(
     }
     post_process_extraction(cache_dir, &layer_order, false, debug, true)?;
     Ok(true)
+}
+
+/// Unpack the payload of a checkpoint file that carries its history (a
+/// `chunked` payload: `checkpoint.json`, `generations/` and `objects/`) into
+/// `dest`.
+///
+/// The caller must already have verified the file's checksum. Only the
+/// `assets_size` bytes the footer declares are read, and every entry goes
+/// through the same hardened unpacker as any other artifact: paths and link
+/// targets stay inside `dest`, and entry and byte limits apply.
+pub fn unpack_checkpoint_history(
+    sidecar_path: &Path,
+    footer: &PackFooter,
+    dest: &Path,
+) -> std::io::Result<()> {
+    fs::create_dir_all(dest)?;
+    let payload = File::open(sidecar_path)?.take(footer.assets_size);
+    let decoder = zstd::stream::Decoder::new(payload)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let mut archive = tar::Archive::new(decoder);
+    safe_unpack_with_policy(
+        &mut archive,
+        dest,
+        &SafeUnpackLimits::from_env(),
+        false,
+        false,
+    )?;
+    Ok(())
+}
+
+/// Extract a checkpoint sidecar's assets into `dest`, leaving out the archive
+/// paths in `skip` and everything under them.
+///
+/// For a restore that installs only some of the assets: a pause checkpoint
+/// also carries the runtime libraries, agent rootfs and storage template, so
+/// the checkpoint can move to another host, but resuming it here uses the
+/// host's own. Unlike [`extract_sidecar`] this writes no cache markers and
+/// does no layer post-processing.
+pub fn extract_checkpoint_sidecar(
+    sidecar_path: &Path,
+    dest: &Path,
+    footer: &PackFooter,
+    skip: &[PathBuf],
+) -> std::io::Result<()> {
+    fs::create_dir_all(dest)?;
+    let decoder = zstd::stream::Decoder::new(File::open(sidecar_path)?.take(footer.assets_size))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let mut archive = tar::Archive::new(decoder);
+    let skip: Vec<PathBuf> = skip.iter().map(|path| normalize_path(path)).collect();
+    safe_unpack_skipping(
+        &mut archive,
+        dest,
+        &SafeUnpackLimits::from_env(),
+        true,
+        false,
+        &skip,
+    )?;
+    Ok(())
 }
 
 fn extract_sidecar_inner(
@@ -4422,6 +4499,57 @@ mod tests {
         header.set_cksum();
         builder.append_data(&mut header, name, data).unwrap();
         builder.into_inner().unwrap()
+    }
+
+    /// A checkpoint file laid out as payload, then `trailer` (the manifest's
+    /// place), plus the footer describing it.
+    fn checkpoint_file(dir: &Path, tar_bytes: &[u8], trailer: &[u8]) -> (PathBuf, PackFooter) {
+        let payload = zstd::encode_all(tar_bytes, 3).unwrap();
+        let path = dir.join("history.checkpoint");
+        let mut bytes = payload.clone();
+        bytes.extend_from_slice(trailer);
+        fs::write(&path, &bytes).unwrap();
+        let footer = PackFooter {
+            stub_size: 0,
+            assets_offset: 0,
+            assets_size: payload.len() as u64,
+            manifest_offset: payload.len() as u64,
+            manifest_size: trailer.len() as u64,
+            checksum: 0,
+        };
+        (path, footer)
+    }
+
+    #[test]
+    fn checkpoint_history_unpack_reads_only_the_declared_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let (path, footer) = checkpoint_file(
+            temp.path(),
+            &make_tar("checkpoint.json", b"{}"),
+            b"{\"not\": \"part of the payload\"}",
+        );
+        let dest = temp.path().join("unpacked");
+        unpack_checkpoint_history(&path, &footer, &dest).unwrap();
+        assert_eq!(fs::read(dest.join("checkpoint.json")).unwrap(), b"{}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_history_unpack_rejects_a_link_out_of_the_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_mode(0o777);
+        builder
+            .append_link(&mut header, "objects/escape", "../../outside")
+            .unwrap();
+        let (path, footer) = checkpoint_file(temp.path(), &builder.into_inner().unwrap(), b"{}");
+        let dest = temp.path().join("unpacked");
+        let error = unpack_checkpoint_history(&path, &footer, &dest).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(fs::symlink_metadata(dest.join("objects/escape")).is_err());
     }
 
     #[cfg(unix)]

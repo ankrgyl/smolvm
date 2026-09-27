@@ -202,6 +202,16 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
         }
     }
 
+    // Once hardened, this process's own page map is root-owned. libkrun reads
+    // it to save a paused fork clone's RAM without touching never-written
+    // pages, so open it now and hand libkrun the descriptor.
+    std::env::remove_var("KRUN_PAGEMAP_FD");
+    #[cfg(target_os = "linux")]
+    if let Ok(pagemap) = std::fs::File::open("/proc/self/pagemap") {
+        use std::os::fd::IntoRawFd;
+        std::env::set_var("KRUN_PAGEMAP_FD", pagemap.into_raw_fd().to_string());
+    }
+
     // Defense-in-depth before this process becomes the VMM host for an untrusted
     // guest: block setuid privilege escalation and core dumps (which would leak
     // guest RAM). See docs/runtime-isolation-hardening.md for the full roadmap.
@@ -718,6 +728,7 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
         egress_refresh_hosts: config.dns_filter_hosts.clone(),
         pod_net: pod_net_launch,
         credentials: config.credentials.as_ref(),
+        external_interceptor: config.external_interceptor,
     });
 
     // If we get here, launch_agent_vm returned (should only happen on error)

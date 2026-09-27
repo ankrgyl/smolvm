@@ -226,6 +226,34 @@ impl SmolvmDb {
         f(guard.as_mut().expect("writer connection present"))
     }
 
+    /// Run a read-then-write transaction on the writer connection.
+    ///
+    /// `f` first runs with SQLite's default deferred transaction, which takes no
+    /// write lock while it reads. If another connection commits between that
+    /// read and the write, the upgrade fails at once with SQLITE_BUSY, which
+    /// `busy_timeout` cannot repair (the read snapshot is stale). The failed
+    /// transaction has rolled back, so `f` then runs once more with the write
+    /// lock taken up front, waiting for it under `busy_timeout`. Uncontended
+    /// transactions never pay for the lock.
+    fn with_write_conn<T, F>(&self, mut f: F) -> Result<T>
+    where
+        F: FnMut(&mut Connection) -> Result<T>,
+    {
+        match self.with_conn(&mut f) {
+            // Retry outside the first attempt's hold on the writer, so other
+            // in-process writes are not queued behind the conflict.
+            Err(error) if error.to_string().contains("database is locked") => {
+                self.with_conn(|conn| {
+                    conn.set_transaction_behavior(TransactionBehavior::Immediate);
+                    let result = f(conn);
+                    conn.set_transaction_behavior(TransactionBehavior::Deferred);
+                    result
+                })
+            }
+            result => result,
+        }
+    }
+
     /// Run a closure with a pooled READ connection. Concurrent reads use
     /// different connections (up to `POOL_MAX_CONNS`) and, under WAL, never block
     /// on the writer — so a stalled write can't serialize or wedge reads. MUST
@@ -332,9 +360,32 @@ impl SmolvmDb {
     /// or `~/.local/share/smolvm/server/smolvm.db` (Linux)
     ///
     /// If the database doesn't exist, it will be created and initialized.
+    ///
+    /// Every call in one process returns the same handle (writer connection and
+    /// reader pool). Each separate handle is another SQLite writer: in the
+    /// server, per-machine paths (state probes, launch preparation, runtime
+    /// cleanup) opened thousands per burst of pool activity, and their writes
+    /// raced the server's own, failing deferred read-then-write transactions
+    /// with SQLITE_BUSY. `open_at` still returns a fresh handle.
     pub fn open() -> Result<Self> {
-        let path = Self::default_path()?;
-        Self::open_at(&path)
+        Self::open_shared(&Self::default_path()?)
+    }
+
+    /// The process-wide handle for `path`, opened on first use. A forked child
+    /// never reuses its parent's connections: the entry records its owner pid.
+    fn open_shared(path: &Path) -> Result<Self> {
+        static SHARED: std::sync::OnceLock<Mutex<HashMap<PathBuf, (u32, SmolvmDb)>>> =
+            std::sync::OnceLock::new();
+        let pid = std::process::id();
+        let mut shared = SHARED.get_or_init(Default::default).lock();
+        if let Some((owner, db)) = shared.get(path) {
+            if *owner == pid {
+                return Ok(db.clone());
+            }
+        }
+        let db = Self::open_at(path)?;
+        shared.insert(path.to_path_buf(), (pid, db.clone()));
+        Ok(db)
     }
 
     /// Open the database at a specific path. Parent directories are created if
@@ -433,7 +484,7 @@ impl SmolvmDb {
         let now = crate::util::current_timestamp();
         let stale_before = now.saturating_sub(CREATE_RESERVATION_TTL_SECS);
 
-        self.with_conn(|conn| {
+        self.with_write_conn(|conn| {
             let tx = conn.transaction().db_err("begin create reservation")?;
 
             if let Some((existing_pid, created_at)) = tx
@@ -495,7 +546,7 @@ impl SmolvmDb {
         record: &VmRecord,
     ) -> Result<bool> {
         let json = serde_json::to_vec(record).db_err("serialize vm record")?;
-        self.with_conn(|conn| {
+        self.with_write_conn(|conn| {
             let tx = conn.transaction().db_err("begin reserved vm commit")?;
 
             let owns_reservation: bool = tx
@@ -1065,7 +1116,7 @@ impl SmolvmDb {
         desired_ready: u32,
         now: u64,
     ) -> Result<Option<ForkPoolRecord>> {
-        self.with_conn(|conn| {
+        self.with_write_conn(|conn| {
             let tx = conn.transaction().db_err("begin fork pool resize")?;
             let data: Option<Vec<u8>> = tx
                 .query_row(
@@ -1242,7 +1293,7 @@ impl SmolvmDb {
         machine_name: &str,
         now: u64,
     ) -> Result<bool> {
-        self.with_conn(|conn| {
+        self.with_write_conn(|conn| {
             let tx = conn.transaction().db_err("begin fork slot reservation")?;
             let pool_data: Option<Vec<u8>> = tx
                 .query_row(
@@ -1326,6 +1377,28 @@ impl SmolvmDb {
         )
     }
 
+    /// Retire a worker only while its slot is still in `expected`.
+    ///
+    /// The pool controller decides from a snapshot of slots and VM records. A
+    /// lease can claim a ready worker in between (clearing its
+    /// `forkpoint_held`), so an unconditional retirement would delete a worker
+    /// that was just handed to a client. Returns false when the slot moved on.
+    pub fn mark_fork_pool_slot_retiring_from(
+        &self,
+        machine_name: &str,
+        expected: ForkPoolSlotState,
+        now: u64,
+        error: Option<String>,
+    ) -> Result<bool> {
+        self.update_fork_pool_slot_state(
+            machine_name,
+            expected,
+            ForkPoolSlotState::Retiring,
+            now,
+            error,
+        )
+    }
+
     /// Retire a worker after provisioning, activation, expiry, or cancellation.
     pub fn mark_fork_pool_slot_retiring(
         &self,
@@ -1333,7 +1406,7 @@ impl SmolvmDb {
         now: u64,
         error: Option<String>,
     ) -> Result<bool> {
-        self.with_conn(|conn| {
+        self.with_write_conn(|conn| {
             let tx = conn.transaction().db_err("begin retire fork pool slot")?;
             let data: Option<Vec<u8>> = tx
                 .query_row(
@@ -1351,7 +1424,7 @@ impl SmolvmDb {
                 serde_json::from_slice(&data).db_err("deserialize fork pool slot")?;
             slot.state = ForkPoolSlotState::Retiring;
             slot.updated_at = now;
-            slot.last_error = error;
+            slot.last_error = error.clone();
             let updated = serde_json::to_vec(&slot).db_err("serialize fork pool slot")?;
             tx.execute(
                 "UPDATE fork_pool_slots SET state = ?2, data = ?3 WHERE machine_name = ?1",
@@ -1371,7 +1444,7 @@ impl SmolvmDb {
         now: u64,
         error: Option<String>,
     ) -> Result<bool> {
-        self.with_conn(|conn| {
+        self.with_write_conn(|conn| {
             let tx = conn.transaction().db_err("begin fork pool slot update")?;
             let data: Option<Vec<u8>> = tx
                 .query_row(
@@ -1389,7 +1462,7 @@ impl SmolvmDb {
                 serde_json::from_slice(&data).db_err("deserialize fork pool slot")?;
             slot.state = next;
             slot.updated_at = now;
-            slot.last_error = error;
+            slot.last_error = error.clone();
             let updated = serde_json::to_vec(&slot).db_err("serialize fork pool slot")?;
             tx.execute(
                 "UPDATE fork_pool_slots SET state = ?2, data = ?3 WHERE machine_name = ?1",
@@ -1746,7 +1819,7 @@ impl SmolvmDb {
         now: u64,
         error: Option<String>,
     ) -> Result<Option<ForkLeaseRecord>> {
-        self.with_conn(|conn| {
+        self.with_write_conn(|conn| {
             let tx = conn.transaction().db_err("begin fork lease transition")?;
             let data: Option<Vec<u8>> = tx
                 .query_row(
@@ -1795,7 +1868,7 @@ impl SmolvmDb {
                     .db_err("deserialize leased fork pool slot")?;
                 slot.state = slot_next;
                 slot.updated_at = now;
-                slot.last_error = error;
+                slot.last_error = error.clone();
                 let slot_updated =
                     serde_json::to_vec(&slot).db_err("serialize leased fork pool slot")?;
                 tx.execute(
@@ -1816,7 +1889,7 @@ impl SmolvmDb {
         lease_id: &str,
         now: u64,
     ) -> Result<Option<ForkLeaseRecord>> {
-        self.with_conn(|conn| {
+        self.with_write_conn(|conn| {
             let tx = conn.transaction().db_err("begin fork lease heartbeat")?;
             let data: Option<Vec<u8>> = tx
                 .query_row(
@@ -1873,7 +1946,7 @@ impl SmolvmDb {
 
     /// Expire overdue active or ambiguous-activation leases and retire workers.
     pub fn expire_fork_leases(&self, now: u64) -> Result<Vec<ForkLeaseRecord>> {
-        self.with_conn(|conn| {
+        self.with_write_conn(|conn| {
             let tx = conn.transaction().db_err("begin fork lease expiry")?;
             let rows: Vec<Vec<u8>> = {
                 let mut stmt = tx
@@ -1995,7 +2068,7 @@ impl SmolvmDb {
         force: bool,
         now: u64,
     ) -> Result<Option<bool>> {
-        self.with_conn(|conn| {
+        self.with_write_conn(|conn| {
             let tx = conn.transaction().db_err("begin fork pool deletion")?;
             let data: Option<Vec<u8>> = tx
                 .query_row(
@@ -2096,7 +2169,7 @@ impl SmolvmDb {
 
     /// Remove fully drained deleting pools and their completed lease history.
     pub fn finalize_deleted_fork_pools(&self) -> Result<Vec<String>> {
-        self.with_conn(|conn| {
+        self.with_write_conn(|conn| {
             let tx = conn.transaction().db_err("begin finalize fork pools")?;
             let pool_rows: Vec<(String, Vec<u8>)> = {
                 let mut stmt = tx
@@ -2686,6 +2759,21 @@ mod tests {
 
         let vms = db.list_vms().unwrap();
         assert_eq!(vms.len(), 2);
+    }
+
+    #[test]
+    fn open_shares_one_handle_per_path_within_a_process() {
+        let dir = TempDir::new().unwrap();
+        let first = SmolvmDb::open_shared(&dir.path().join("test.db")).unwrap();
+        let second = SmolvmDb::open_shared(&dir.path().join("test.db")).unwrap();
+        assert!(Arc::ptr_eq(&first.writer, &second.writer));
+        assert!(Arc::ptr_eq(&first.readers, &second.readers));
+
+        let other = SmolvmDb::open_shared(&dir.path().join("other.db")).unwrap();
+        assert!(!Arc::ptr_eq(&first.writer, &other.writer));
+        // open_at stays a separate handle (tests rely on real second connections).
+        let separate = SmolvmDb::open_at(&dir.path().join("test.db")).unwrap();
+        assert!(!Arc::ptr_eq(&first.writer, &separate.writer));
     }
 
     #[test]
@@ -3432,6 +3520,122 @@ mod tests {
             db.list_fork_pool_slots("rollouts").unwrap()[0].state,
             ForkPoolSlotState::Retiring
         );
+    }
+
+    /// Two handles on one database, as the server and a VM helper process
+    /// have. A deferred read-then-write transaction that loses the write race
+    /// fails at once with SQLITE_BUSY ("database is locked"): `busy_timeout`
+    /// cannot repair a stale read snapshot.
+    #[test]
+    fn lease_transitions_from_two_handles_never_fail_busy() {
+        let (dir, db) = temp_db();
+        let other = SmolvmDb::open_at(&dir.path().join("test.db")).unwrap();
+        const LEASES: usize = 16;
+        db.insert_fork_pool_if_not_exists(&test_pool("rollouts", LEASES as u32))
+            .unwrap();
+        for i in 0..LEASES {
+            insert_ready_pool_slot(&db, "rollouts", &format!("slot-{i}"));
+            db.claim_fork_pool_slot(ForkPoolSlotClaim {
+                pool_name: "rollouts",
+                lease_id: &format!("lease-{i}"),
+                idempotency_key: &format!("request-{i}"),
+                assignment: &[],
+                payload_sha256: None,
+                require_private_workspace: false,
+                admission_limit: None,
+                ttl_secs: 60,
+                now: 200,
+            })
+            .unwrap();
+            db.mark_fork_lease_active(&format!("lease-{i}"), 201)
+                .unwrap();
+        }
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(LEASES));
+        let workers = (0..LEASES)
+            .map(|i| {
+                let handle = if i % 2 == 0 {
+                    db.clone()
+                } else {
+                    other.clone()
+                };
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    (0..200)
+                        .filter_map(|beat| {
+                            handle
+                                .heartbeat_fork_lease("rollouts", &format!("lease-{i}"), 202 + beat)
+                                .err()
+                                .map(|e| e.to_string())
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        let errors = workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            errors.is_empty(),
+            "{} heartbeats failed, e.g. {:?}",
+            errors.len(),
+            errors.first()
+        );
+    }
+
+    #[test]
+    fn controller_retirement_cannot_take_a_worker_claimed_after_its_snapshot() {
+        let (_dir, db) = temp_db();
+        db.insert_fork_pool_if_not_exists(&test_pool("rollouts", 1))
+            .unwrap();
+        insert_ready_pool_slot(&db, "rollouts", "slot-1");
+        // The controller lists the slot as ready...
+        assert_eq!(
+            db.list_fork_pool_slots("rollouts").unwrap()[0].state,
+            ForkPoolSlotState::Ready
+        );
+        // ...then a lease claims it, which releases the forkpoint...
+        assert!(matches!(
+            db.claim_fork_pool_slot(ForkPoolSlotClaim {
+                pool_name: "rollouts",
+                lease_id: "lease-1",
+                idempotency_key: "request-1",
+                assignment: &[],
+                payload_sha256: None,
+                require_private_workspace: false,
+                admission_limit: None,
+                ttl_secs: 60,
+                now: 200,
+            })
+            .unwrap(),
+            ClaimForkPoolSlot::Claimed(_)
+        ));
+        // ...so the controller's VM check now sees a worker that is not held.
+        assert!(!db.get_vm("slot-1").unwrap().unwrap().forkpoint_held);
+
+        assert!(!db
+            .mark_fork_pool_slot_retiring_from("slot-1", ForkPoolSlotState::Ready, 201, None)
+            .unwrap());
+        db.mark_fork_lease_active("lease-1", 202).unwrap();
+        assert_eq!(
+            db.get_fork_pool_slot("slot-1").unwrap().unwrap().state,
+            ForkPoolSlotState::Leased
+        );
+        assert!(db.list_retiring_fork_pool_slots().unwrap().is_empty());
+    }
+
+    #[test]
+    fn controller_retires_a_ready_worker_that_is_still_ready() {
+        let (_dir, db) = temp_db();
+        db.insert_fork_pool_if_not_exists(&test_pool("rollouts", 1))
+            .unwrap();
+        insert_ready_pool_slot(&db, "rollouts", "slot-1");
+        assert!(db
+            .mark_fork_pool_slot_retiring_from("slot-1", ForkPoolSlotState::Ready, 201, None)
+            .unwrap());
+        assert_eq!(db.list_retiring_fork_pool_slots().unwrap().len(), 1);
     }
 
     #[test]

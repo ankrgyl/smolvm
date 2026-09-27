@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use crate::agent::{AgentClient, AgentManager, ExecEvent, RunConfig};
+use crate::agent::{AgentClient, AgentManager, RunConfig};
 use crate::config::VmRecord;
 use crate::Result;
 use smolvm_protocol::ImageInfo;
@@ -40,6 +40,11 @@ impl VmHandle {
         self.manager.state().to_string()
     }
 
+    /// Where the VM's agent listens, for opening a dedicated connection.
+    pub fn agent_socket(&self) -> std::path::PathBuf {
+        self.manager.vsock_socket().to_path_buf()
+    }
+
     fn client_mut(&mut self) -> Result<&mut AgentClient> {
         if self.client.is_none() {
             self.client = Some(self.manager.connect()?);
@@ -47,29 +52,16 @@ impl VmHandle {
         Ok(self.client.as_mut().expect("client initialized"))
     }
 
-    /// Execute a command directly in the VM.
-    pub fn exec(
-        &mut self,
-        command: Vec<String>,
-        env: Vec<(String, String)>,
-        workdir: Option<String>,
-        timeout: Option<Duration>,
-    ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
-        self.client_mut()?
-            .vm_exec(command, env, workdir, timeout, None)
+    /// Run a prebuilt [`RunConfig`] over the cached connection, for callers
+    /// that have already decided the image and overlay.
+    pub fn run_config(&mut self, config: RunConfig) -> Result<(i32, Vec<u8>, Vec<u8>)> {
+        self.client_mut()?.run_non_interactive(config)
     }
 
     /// Pull an OCI image and run a command inside it.
     ///
     /// Returns `(exit_code, stdout_bytes, stderr_bytes)`. Bytes are raw
     /// to preserve binary output.
-    /// Run a prebuilt [`RunConfig`] and return its result. The non-streaming
-    /// counterpart of [`Self::run_streaming_with`], for callers that have already
-    /// decided the image and overlay — notably an exec against an image machine.
-    pub fn run_config(&mut self, config: RunConfig) -> Result<(i32, Vec<u8>, Vec<u8>)> {
-        self.client_mut()?.run_non_interactive(config)
-    }
-
     pub fn run(
         &mut self,
         image: &str,
@@ -124,34 +116,6 @@ impl VmHandle {
     /// Read a file from the VM.
     pub fn read_file(&mut self, path: &str) -> Result<Vec<u8>> {
         self.client_mut()?.read_file(path)
-    }
-
-    /// Execute a command, delivering stdout/stderr/exit events LIVE via the
-    /// callback as each frame arrives (no buffering). SDKs bridge this to a
-    /// language-native iterator (Python generator / JS async iterator).
-    pub fn exec_streaming_with<F: FnMut(ExecEvent)>(
-        &mut self,
-        command: Vec<String>,
-        env: Vec<(String, String)>,
-        workdir: Option<String>,
-        timeout: Option<Duration>,
-        on_event: F,
-    ) -> Result<()> {
-        self.client_mut()?
-            .vm_exec_streaming_with(command, env, workdir, timeout, on_event)
-    }
-
-    /// Stream a command's output LIVE while running it inside the image's
-    /// container overlay (the `RunConfig` carries the persistent-overlay id).
-    /// The streaming counterpart of `run` — used for image machines so streamed
-    /// execs share the same container filesystem + persistence as non-streaming
-    /// execs, instead of running in the bare agent rootfs.
-    pub fn run_streaming_with<F: FnMut(ExecEvent)>(
-        &mut self,
-        config: RunConfig,
-        on_event: F,
-    ) -> Result<()> {
-        self.client_mut()?.run_streaming_with(config, on_event)
     }
 
     /// Copy every guest-local staged mount back to its host source.

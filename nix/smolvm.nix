@@ -17,23 +17,23 @@
   gnutar,
   coreutils,
 }: let
-  version = "1.18.1";
+  version = "1.19.2";
 
   releases = {
     x86_64-linux = {
       asset = "smolvm-${version}-linux-x86_64.tar.gz";
       root = "smolvm-${version}-linux-x86_64";
-      hash = "sha256-mcGvIU6IaLE9faAOrTp5ejamStnS9Z0CmvNBJihXKnI=";
+      hash = "sha256-61G7g60RMDDzKbrpQ75lPBkuHpVD6Y9QK1omggM3adg=";
     };
     aarch64-linux = {
       asset = "smolvm-${version}-linux-arm64.tar.gz";
       root = "smolvm-${version}-linux-arm64";
-      hash = "sha256-pKlx4cCN7AJ/KuRbn4zeULkcuH9s6NlA1oCvHddZfZs=";
+      hash = "sha256-tF3oeHDUhtzlEbaK8dOcK0BOTIRXL0lZyN/rhtkT3SQ=";
     };
     aarch64-darwin = {
       asset = "smolvm-${version}-darwin-arm64.tar.gz";
       root = "smolvm-${version}-darwin-arm64";
-      hash = "sha256-yYfTNdfkGevC8Nq8mIL57hADClFQrUZoobGzxCI9Av4=";
+      hash = "sha256-h41YG63wjN6FwRTVLtNcduHAHn2OV+fIF5V6XaWhR5g=";
     };
   };
 

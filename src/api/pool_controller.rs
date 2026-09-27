@@ -234,8 +234,9 @@ impl ForkPoolController {
                     if recoverable {
                         db.mark_fork_pool_slot_ready(&machine, crate::util::current_timestamp())
                     } else {
-                        db.mark_fork_pool_slot_retiring(
+                        db.mark_fork_pool_slot_retiring_from(
                             &machine,
+                            ForkPoolSlotState::Provisioning,
                             crate::util::current_timestamp(),
                             Some("controller restarted during worker provisioning".into()),
                         )
@@ -448,9 +449,13 @@ impl ForkPoolController {
                 if !valid {
                     let db = self.state.db().clone();
                     let machine = slot.machine_name;
+                    // A lease may have claimed this worker since the slots were
+                    // listed; claiming clears `forkpoint_held`. Only a worker that
+                    // is still ready may be retired here.
                     tokio::task::spawn_blocking(move || {
-                        db.mark_fork_pool_slot_retiring(
+                        db.mark_fork_pool_slot_retiring_from(
                             &machine,
+                            ForkPoolSlotState::Ready,
                             crate::util::current_timestamp(),
                             Some("ready worker is missing, dead, or no longer held".into()),
                         )
@@ -504,7 +509,7 @@ impl ForkPoolController {
             let machine = lease.machine_name.clone();
             let alive = tokio::task::spawn_blocking(move || {
                 db.get_vm(&machine)
-                    .map(|record| record.map(|vm| vm.is_process_alive()).unwrap_or(false))
+                    .map(|record| record.as_ref().is_some_and(leased_worker_is_live))
             })
             .await
             .map_err(|e| e.to_string())?
@@ -782,6 +787,16 @@ impl ForkPoolController {
     }
 }
 
+/// Whether a leased worker still exists for its client.
+///
+/// A paused worker has no VMM process, but its execution is saved and the
+/// client resumes it under the same name; retiring it would delete that saved
+/// execution.
+fn leased_worker_is_live(record: &crate::config::VmRecord) -> bool {
+    use crate::config::RecordState;
+    record.is_process_alive() || matches!(record.state, RecordState::Paused | RecordState::Pausing)
+}
+
 fn update_retained_snapshot(
     snapshots: &mut std::collections::HashMap<String, crate::agent::fork::RetainedForkSnapshot>,
     golden: &str,
@@ -811,6 +826,19 @@ fn retain_existing_checkpoint_sources(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_paused_leased_worker_is_not_retired_as_dead() {
+        use crate::config::{RecordState, VmRecord};
+        let mut record = VmRecord::new("worker".into(), 1, 512, vec![], vec![], false);
+        record.pid = None;
+        record.state = RecordState::Stopped;
+        assert!(!leased_worker_is_live(&record));
+        for state in [RecordState::Paused, RecordState::Pausing] {
+            record.state = state;
+            assert!(leased_worker_is_live(&record));
+        }
+    }
 
     #[test]
     fn fill_backoff_grows_and_caps() {
