@@ -585,6 +585,7 @@ impl PackRunCmd {
                 .egress
                 .as_ref()
                 .and_then(|policy| policy.allowed_cidrs.clone()),
+            egress_rules: Vec::new(),
         };
         validate_requested_network_backend(
             &resources,
@@ -1778,6 +1779,7 @@ fn run_from_cache(
         gpu_vram_mib: None,
         rosetta: false,
         allowed_cidrs: None,
+        egress_rules: Vec::new(),
     };
     validate_requested_network_backend(&resources, None, ports.len())?;
 
@@ -2215,6 +2217,7 @@ fn daemon_start(
         gpu_vram_mib: None,
         rosetta: false,
         allowed_cidrs: None,
+        egress_rules: Vec::new(),
     };
     validate_requested_network_backend(&resources, None, ports.len())?;
 

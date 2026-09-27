@@ -1693,6 +1693,7 @@ impl RunCmd {
             storage_gib: params.storage_gb,
             overlay_gib: params.overlay_gb,
             allowed_cidrs: params.allowed_cidrs.clone(),
+            egress_rules: Vec::new(),
             block_io: params.block_io,
             disks: Vec::new(),
         };
@@ -3905,6 +3906,7 @@ impl CreateCmd {
             storage_gib: params.storage_gb,
             overlay_gib: params.overlay_gb,
             allowed_cidrs: params.allowed_cidrs.clone(),
+            egress_rules: Vec::new(),
             block_io: params.block_io,
             disks: Vec::new(),
         };
@@ -4302,6 +4304,7 @@ impl CreateCmd {
             block_io: params.block_io,
             disks: params.disks.clone(),
             allowed_cidrs: params.allowed_cidrs.clone(),
+            egress_rules: Vec::new(),
         };
         resources.validate()?;
         validate_requested_network_backend(
@@ -4514,6 +4517,10 @@ pub struct StartCmd {
     #[arg(long, value_name = "ADDR", requires = "name")]
     pub egress_interceptor: Option<std::net::SocketAddr>,
 
+    /// Require a pre-dial host decision for each outbound TCP flow.
+    #[arg(long, requires = "egress_interceptor")]
+    pub mediated_egress: bool,
+
     #[arg(
         long,
         env = "SMOLVM_INTERCEPTOR_TOKEN",
@@ -4556,6 +4563,7 @@ impl StartCmd {
             vm_common::StartOptions {
                 no_workload: self.no_workload,
                 external_interceptor,
+                mediated_egress: self.mediated_egress,
             },
         ) {
             Ok(()) => Ok(()),
@@ -4723,10 +4731,27 @@ pub struct ForkCmd {
         help_heading = "Security"
     )]
     pub secret_file: Vec<String>,
+
+    /// Rebind a host egress interceptor for each branched child.
+    #[arg(long, value_name = "ADDR")]
+    pub egress_interceptor: Option<std::net::SocketAddr>,
+
+    #[arg(
+        long,
+        env = "SMOLVM_INTERCEPTOR_TOKEN",
+        hide = true,
+        hide_env_values = true,
+        value_parser = clap::builder::StringValueParser::new().map(smolvm::secrets::Secret::new)
+    )]
+    pub egress_interceptor_token: Option<smolvm::secrets::Secret>,
 }
 
 impl ForkCmd {
     pub fn run(self) -> smolvm::Result<()> {
+        let external_interceptor = parse_external_interceptor(
+            self.egress_interceptor,
+            self.egress_interceptor_token.as_ref(),
+        )?;
         let ports: Vec<(u16, u16)> = PortMappingSpec::expand_all(&self.port)
             .map_err(|e| smolvm::Error::config("branch ports", e))?
             .into_iter()
@@ -4784,6 +4809,7 @@ impl ForkCmd {
                     wait_ready,
                     hold: self.hold,
                     freeze_source: self.freeze_source,
+                    external_interceptor,
                 },
             );
         }
@@ -4856,6 +4882,7 @@ impl ForkCmd {
                 hold: self.hold,
                 freeze_source: self.freeze_source,
                 worker_ready,
+                external_interceptor,
             },
         )
     }
@@ -5564,6 +5591,15 @@ impl UpdateCmd {
                     changes.push("  cleared dns_filter_hosts".to_string());
                     r.dns_filter_hosts = None;
                 }
+                if !r.egress_rules.is_empty() {
+                    changes.push("  cleared egress_rules".to_string());
+                    r.egress_rules.clear();
+                }
+                if r.external_interceptor_required || r.mediated_egress_required {
+                    changes.push("  cleared egress interceptor requirement".to_string());
+                    r.external_interceptor_required = false;
+                    r.mediated_egress_required = false;
+                }
                 // virtio-net without networking or published ports is rejected
                 // at launch, so a machine that keeps the backend could never
                 // start again. Published ports still need it.
@@ -5574,7 +5610,16 @@ impl UpdateCmd {
             }
             if self.no_egress_interceptor && r.external_interceptor_required {
                 r.external_interceptor_required = false;
+                r.mediated_egress_required = false;
                 changes.push("  external egress interceptor requirement: removed".to_string());
+            }
+            if self.no_egress_interceptor {
+                let before = r.egress_rules.len();
+                r.egress_rules
+                    .retain(|rule| rule.action != smolvm_protocol::RuleAction::Redirect);
+                if r.egress_rules.len() != before {
+                    changes.push("  removed redirect egress rules".to_string());
+                }
             }
 
             // Env vars
@@ -6213,12 +6258,6 @@ impl MonitorCmd {
                 record.credential_policy.is_some(),
                 false,
             )?;
-            if record.forkable_on_start() {
-                return Err(Error::config(
-                    "egress interceptor",
-                    "external interception does not support branch launches",
-                ));
-            }
         }
         if record.external_interceptor_required && external_interceptor.is_none() {
             return Err(Error::config(
