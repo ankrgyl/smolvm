@@ -468,17 +468,26 @@ pub fn fork_vm_batch(
     clones: &[(String, Vec<(u16, u16)>)],
     parallel: usize,
 ) -> Result<Vec<(String, VmHandle)>> {
+    if clones.is_empty() {
+        return Err(Error::config(
+            "fork batch",
+            "at least one clone is required",
+        ));
+    }
+    let mut names = std::collections::HashSet::new();
+    for (name, _) in clones {
+        if !names.insert(name) {
+            return Err(Error::config(
+                "fork batch",
+                format!("duplicate clone name '{name}'"),
+            ));
+        }
+    }
     let _source_lock = crate::agent::fork::lock_fork_source(golden)?;
     if get_record(db, golden)?.mediated_egress_required {
         return Err(Error::config(
             "fork batch",
             "this embedded fork path cannot bind a mediated interceptor; use the machine branch API",
-        ));
-    }
-    if clones.is_empty() {
-        return Err(Error::config(
-            "fork batch",
-            "at least one clone is required",
         ));
     }
     let empty_secrets = std::collections::BTreeMap::new();
