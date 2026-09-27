@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Linux/KVM integration check for the mediated API and branch lifecycle.
+"""Linux or macOS VM integration check for the mediated API and branch lifecycle.
 
 Run with SMOLVM_E2E_BIN=/path/to/smolvm python3 tests/mediated_egress_e2e.py.
 Uses isolated XDG directories and cleans up its machines and API server.
@@ -50,8 +50,23 @@ def main():
     listener.bind(("127.0.0.1", 0))
     listener.listen(8)
     listener.settimeout(0.2)
+    direct_listener = socket.socket()
+    direct_listener.bind(("127.0.0.1", 0))
+    direct_listener.listen(1)
+    direct_listener.settimeout(15)
+    direct_port = direct_listener.getsockname()[1]
     flows, broker_errors = [], []
     done = threading.Event()
+
+    def direct_server():
+        with direct_listener:
+            stream, _ = direct_listener.accept()
+            with stream:
+                stream.settimeout(5)
+                assert read_exact(stream, 6) == b"direct"
+                stream.sendall(b"direct-ok\n")
+
+    direct_worker = threading.Thread(target=direct_server, daemon=True)
 
     def broker():
         while not done.is_set():
@@ -83,6 +98,9 @@ def main():
             XDG_CACHE_HOME=root + "/cache",
             XDG_DATA_HOME=root + "/data",
             XDG_CONFIG_HOME=root + "/config",
+            # This local probe dials the guest gateway's CGNAT address, which
+            # the fleet's strict floor intentionally blocks even with a rule.
+            SMOLVM_EGRESS_FLOOR="metadata",
             SMOLVM_GUEST_ROLLOUT_HOST_PORT=str(rollout_port),
         )
         if sys.platform == "darwin":
@@ -142,6 +160,7 @@ def main():
                         {"transport": "tcp", "cidr": "1.1.1.1/32", "ports": {"start": 80, "end": 80}, "action": "deny"},
                         {"transport": "tcp", "cidr": "1.1.1.1/32", "ports": {"start": 443, "end": 443}, "action": "redirect"},
                         {"transport": "tcp", "cidr": "1.1.1.1/32", "ports": {"start": 8443, "end": 8443}, "action": "allow"},
+                        {"transport": "tcp", "cidr": "100.96.0.1/32", "ports": {"start": direct_port, "end": direct_port}, "action": "allow"},
                         {"transport": "udp", "cidr": "1.1.1.1/32", "ports": {"start": 124, "end": 124}, "action": "allow"},
                     ]})[0] == 200
                 assert api("POST", "/source/start")[0] == 400
@@ -165,7 +184,13 @@ def main():
                 assert flows[0][2] == flows[1][2] == b"hello", flows
 
                 api("POST", "/source/exec", {"command": ["sh", "-c", "printf deny | nc -w 1 1.1.1.1 80"]})
-                api("POST", "/source/exec", {"command": ["sh", "-c", "printf direct | nc -w 1 1.1.1.1 8443"]})
+                direct_worker.start()
+                status, result = api("POST", "/source/exec", {"command": [
+                    "sh", "-c", f"printf direct | nc -w 2 100.96.0.1 {direct_port}",
+                ]})
+                assert status == 200 and result["exitCode"] == 0 and result["stdout"] == "direct-ok\n", (result, api("GET", "/source/mediation-events"), broker_errors)
+                direct_worker.join(timeout=1)
+                assert not direct_worker.is_alive()
                 assert len(flows) == 2, flows
 
                 # These protocols must be denied by the same host boundary.
@@ -201,6 +226,9 @@ def main():
                 done.set()
                 listener.close()
                 worker.join(timeout=1)
+                direct_listener.close()
+                if direct_worker.ident is not None:
+                    direct_worker.join(timeout=1)
                 api("POST", "/source/exec", {"command": [
                     "sh", "-c", "printf hello | nc -w 2 1.1.1.1 443",
                 ]})
@@ -213,7 +241,7 @@ def main():
                 ), audit
                 assert api("POST", "/source/stop")[0] == 200
                 assert api("POST", "/source/start")[0] == 400
-                print("mediated egress API, broker, audit, branch identity, and restart fence: PASS")
+                print("mediated egress API, direct relay, broker, audit, branch identity, and restart fence: PASS")
             finally:
                 for name in ("child", "source"):
                     try:
