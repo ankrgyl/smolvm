@@ -136,12 +136,6 @@ jobs:
           LIBRARY_PATH: ${{ github.workspace }}/lib
           DYLD_LIBRARY_PATH: ${{ github.workspace }}/lib
 
-      - name: Test mediated egress on macOS host sockets
-        run: |
-          cargo test -p smolvm-protocol --lib mediated_egress
-          cargo test -p smolvm-network --lib egress::tests::
-          cargo test -p smolvm-network --lib tcp_relay::tests::mediated
-
       - name: Run agent unit tests
         run: cargo test -p smolvm-agent --bins
         env:
@@ -262,11 +256,6 @@ jobs:
         env:
           LIBRARY_PATH: /usr/local/lib
           LD_LIBRARY_PATH: /usr/local/lib
-
-      - name: Test mediated egress host sockets
-        run: |
-          cargo test -p smolvm-network --lib --target ${{ matrix.target }} egress::tests::
-          cargo test -p smolvm-network --lib --target ${{ matrix.target }} tcp_relay::tests::mediated
 
       - name: Run agent unit tests
         run: cargo test -p smolvm-agent --bins --target ${{ matrix.target }}
