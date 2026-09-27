@@ -287,7 +287,20 @@ env = [
 ]
 ```
 
-Proxy vars are NOT forwarded automatically — each VM gets exactly the env you specify. The VM uses the host's DNS server (from `/etc/resolv.conf`) for name resolution.
+Proxy vars are NOT forwarded automatically — each VM gets exactly the env you specify, unless you ask for the host's (below). The VM uses the host's DNS server (from `/etc/resolv.conf`) for name resolution.
+
+### Behind a corporate firewall
+
+Two opt-in flags on `machine run` / `machine create` carry the host's network setup into the machine:
+
+```bash
+smolvm machine run --use-host-proxy --trust-host-certs --image python:3.12 -- pip install requests
+```
+
+- `--use-host-proxy` — the host's `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`/`NO_PROXY` (or, on macOS, the system proxy when none is set) become the workload's proxy env, in both cases. A proxy on the host's `localhost` is rewritten to an address the machine can reach; the machine's own loopback is always in `NO_PROXY`. Implies `--net`. A PAC-file-only Mac gets an error asking for `HTTPS_PROXY`.
+- `--trust-host-certs` — the certificates the host trusts (macOS: system roots + System keychain, where a corporate TLS-inspection root is installed; Linux: the system bundle) are mounted read-only at `/etc/smolvm-host-trust/ca-bundle.pem`, and `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`, `PIP_CERT`, `AWS_CA_BUNDLE`, `CARGO_HTTP_CAINFO`, `DENO_CERT` point at it. `SMOLVM_HOST_CA_BUNDLE=/path` reads a different bundle (Nix, custom stores). Not combinable with `--credential` yet. Tools with their own trust store (Java keystores, `apt` over HTTPS) still need it configured in the image.
+
+Values passed with `-e` win over both flags, and `machine create` persists them.
 
 ## SSH Agent Forwarding
 

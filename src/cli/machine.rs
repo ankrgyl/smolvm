@@ -630,6 +630,20 @@ pub struct RunCmd {
     #[arg(long = "allow-host", value_name = "HOSTNAME", help_heading = "Network")]
     pub allow_host: Vec<String>,
 
+    /// Pass this host's proxy into the workload: HTTPS_PROXY/HTTP_PROXY/
+    /// ALL_PROXY/NO_PROXY from the environment, or on macOS the system proxy.
+    /// A proxy on the host's loopback is rewritten to an address the guest can
+    /// reach. Implies --net.
+    #[arg(long, help_heading = "Network")]
+    pub use_host_proxy: bool,
+
+    /// Trust the certificates this host trusts inside the workload — e.g. a
+    /// corporate TLS-inspection root on the host. Mounts them read-only at
+    /// /etc/smolvm-host-trust/ca-bundle.pem and points SSL_CERT_FILE,
+    /// NODE_EXTRA_CA_CERTS, REQUESTS_CA_BUNDLE and similar at it.
+    #[arg(long, help_heading = "Network")]
+    pub trust_host_certs: bool,
+
     /// Bind a credential the workload may use without ever seeing it:
     /// NAME=ENV_VAR@HOST[,HOST...]. The guest gets a placeholder in ENV_VAR;
     /// the host substitutes the real value (from a `--secret-env`/`--secret-file`
@@ -1210,8 +1224,24 @@ fn explain_vm_death(manager: &smolvm::agent::AgentManager, error: smolvm::Error)
 }
 
 impl RunCmd {
-    pub fn run(self) -> smolvm::Result<()> {
+    pub fn run(mut self) -> smolvm::Result<()> {
         use smolvm::Error;
+
+        let host = crate::cli::host_network::HostNetwork::resolve(
+            self.use_host_proxy,
+            self.trust_host_certs,
+            !self.credential.is_empty(),
+        )?;
+        self.env = host
+            .env
+            .into_iter()
+            .chain(std::mem::take(&mut self.env))
+            .collect();
+        self.volume.extend(host.volumes);
+        if self.proxy_opts.proxy.is_none() {
+            self.proxy_opts.proxy = host.pull_proxy;
+        }
+        self.net |= self.use_host_proxy;
 
         // --max-image-size raises the archive cap for this invocation by setting
         // the env var the resolver reads (image_source::max_archive_bytes).
@@ -3597,6 +3627,20 @@ pub struct CreateCmd {
     #[arg(long = "allow-host", value_name = "HOSTNAME")]
     pub allow_host: Vec<String>,
 
+    /// Pass this host's proxy into the workload: HTTPS_PROXY/HTTP_PROXY/
+    /// ALL_PROXY/NO_PROXY from the environment, or on macOS the system proxy.
+    /// A proxy on the host's loopback is rewritten to an address the guest can
+    /// reach. Implies --net.
+    #[arg(long, help_heading = "Network")]
+    pub use_host_proxy: bool,
+
+    /// Trust the certificates this host trusts inside the workload — e.g. a
+    /// corporate TLS-inspection root on the host. Mounts them read-only at
+    /// /etc/smolvm-host-trust/ca-bundle.pem and points SSL_CERT_FILE,
+    /// NODE_EXTRA_CA_CERTS, REQUESTS_CA_BUNDLE and similar at it.
+    #[arg(long, help_heading = "Network")]
+    pub trust_host_certs: bool,
+
     /// Bind a credential the workload may use without ever seeing it:
     /// NAME=ENV_VAR@HOST[,HOST...]. The guest gets a placeholder in ENV_VAR;
     /// the host substitutes the real value (from a `--secret-env`/`--secret-file`
@@ -3744,7 +3788,19 @@ fn parse_attached_disks(specs: &[String]) -> smolvm::Result<Vec<smolvm::data::di
 }
 
 impl CreateCmd {
-    pub fn run(self) -> smolvm::Result<()> {
+    pub fn run(mut self) -> smolvm::Result<()> {
+        let host = crate::cli::host_network::HostNetwork::resolve(
+            self.use_host_proxy,
+            self.trust_host_certs,
+            !self.credential.is_empty(),
+        )?;
+        self.env = host
+            .env
+            .into_iter()
+            .chain(std::mem::take(&mut self.env))
+            .collect();
+        self.volume.extend(host.volumes);
+        self.net |= self.use_host_proxy;
         // Everything after `--` is the workload, so machine options written
         // there are handed to the guest command and quietly do not configure the
         // machine — a swallowed `--mem`/`--storage` boots a machine at the

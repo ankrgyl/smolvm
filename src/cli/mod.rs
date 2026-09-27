@@ -2,6 +2,7 @@
 
 pub mod cleanup_ephemeral;
 pub mod config;
+pub mod host_network;
 pub mod machine;
 pub mod openapi;
 pub mod pack;
